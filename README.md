@@ -17,3 +17,34 @@ cargo run --release
 cargo run --release -- search "quantum mutual information" --providers openaire,inspire,ads --export-csv-dir ./cit_atlas_csv
 cargo run --release -- rate-limits --simulate-burst --export-policies-csv ./domain_rate_policies.csv --export-audit-csv ./crawl_telemetry_audit.csv
 ```
+
+## Headless Validation
+
+Run the offline headless validation suite exercising 24-domain concurrent token-bucket rate limiting, citation DAG Louvain/Infomap/PageRank/Disruption scientometrics, and multi-provider deduplication + BibTeX/GraphML/GEXF/CSV/SQLite roundtrips:
+
+```bash
+cargo test --test headless_validation -- --nocapture
+```
+
+Validation artifacts (`cit_atlas_validation_summary.json` and `citation_network_metrics.csv`) are documented in [`validation/README.md`](validation/README.md).
+
+## Citation & CRV Science Apps Hub
+
+- **CRV Science Apps Hub**: <https://crvscience.com/apps>
+- **Preprint (`APP-PREPRINT-05`)**: [Cit-Atlas: Rate-Limited Multi-Provider Bibliometric Graph Harvesting, Louvain Community Detection, and Scientometric Analytics](https://crvscience.com/apps/preprints/cit-atlas-bibliometric-graph-engine)
+- **Concept DOI**: [`10.5281/zenodo.24222380`](https://doi.org/10.5281/zenodo.24222380)
+
+```bibtex
+@article{white2026citatlas,
+  author  = {Bryan P. White},
+  title   = {Cit-Atlas: Rate-Limited Multi-Provider Bibliometric Graph Harvesting, Louvain Community Detection, and Scientometric Analytics},
+  year    = {2026},
+  journal = {CRV Science Apps Preprints},
+  note    = {APP-PREPRINT-05, v1.8.0},
+  doi     = {10.5281/zenodo.24222380},
+  url     = {https://crvscience.com/apps/preprints/cit-atlas-bibliometric-graph-engine}
+}
+```
+
+See [`CITATION.cff`](CITATION.cff) for machine-readable citation metadata.
+

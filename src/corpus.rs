@@ -834,62 +834,6 @@ pub fn build_empirical_corpus() -> (Vec<PaperRecord>, Vec<CitationEdge>) {
     let mut edges = Vec::new();
 
     for s in EMPIRICAL_SEED {
-        let mut syn_dc = Vec::new();
-        let mut syn_bio = Vec::new();
-        let hub_stride = (n / 180).max(6);
-        if i % hub_stride == 0 {
-            let bucket = (i / hub_stride) % 16;
-            let acc = format!("P{:05}", 10000 + bucket);
-            let pdb = format!("7A{:02}", bucket % 90 + 10);
-            syn_dc.push(DataCiteLink {
-                artifact_doi: format!("10.5281/zenodo.{}", 800000 + bucket),
-                artifact_title: format!("Shared Benchmark Corpus Asset #{}", bucket + 1),
-                artifact_kind: if bucket % 2 == 0 {
-                    DataCiteArtifactKind::Dataset
-                } else {
-                    DataCiteArtifactKind::Software
-                },
-                repository: "Zenodo".to_string(),
-                relation_type: "IsSupplementTo".to_string(),
-                citation_count: 14,
-                view_count: 420,
-                download_count: 185,
-            });
-            syn_bio.push(BioEntityBridgeLink {
-                entity_id: acc.clone(),
-                kind: BioEntityKind::UniProt,
-                label: format!("Conserved Regulatory Protein {}", acc),
-                uri: format!("https://www.uniprot.org/uniprotkb/{}", acc),
-                provider: "UniProtKB".to_string(),
-                section: "Results".to_string(),
-                mention_count: 3,
-                linked_pdb_ids: vec![pdb.clone()],
-                resolution_angstrom: None,
-            });
-            syn_bio.push(BioEntityBridgeLink {
-                entity_id: pdb.clone(),
-                kind: BioEntityKind::PdbStructure,
-                label: format!("Cryo-EM Complex {}", pdb),
-                uri: format!("https://www.rcsb.org/structure/{}", pdb),
-                provider: "RCSB PDB".to_string(),
-                section: "Methods".to_string(),
-                mention_count: 2,
-                linked_pdb_ids: Vec::new(),
-                resolution_angstrom: Some(2.45),
-            });
-            syn_bio.push(BioEntityBridgeLink {
-                entity_id: format!("GO:{:07}", 6410 + (bucket % 12)),
-                kind: BioEntityKind::GeneOntology,
-                label: "biological regulation pathway".to_string(),
-                uri: format!("http://purl.obolibrary.org/obo/GO_{:07}", 6410 + (bucket % 12)),
-                provider: "Europe PMC".to_string(),
-                section: "Abstract".to_string(),
-                mention_count: 4,
-                linked_pdb_ids: Vec::new(),
-                resolution_angstrom: None,
-            });
-        }
-
         papers.push(PaperRecord {
             id: s.id.to_string(),
             title: s.title.to_string(),
@@ -1150,6 +1094,62 @@ pub fn generate_synthetic_corpus(
             if !concepts.iter().any(|c| c == pick) {
                 concepts.push(pick.to_string());
             }
+        }
+
+        let mut syn_dc = Vec::new();
+        let mut syn_bio = Vec::new();
+        let hub_stride = (n / 180).max(6);
+        if i % hub_stride == 0 {
+            let bucket = (i / hub_stride) % 16;
+            let acc = format!("P{:05}", 10000 + bucket);
+            let pdb = format!("7A{:02}", bucket % 90 + 10);
+            syn_dc.push(DataCiteLink {
+                artifact_doi: format!("10.5281/zenodo.{}", 800000 + bucket),
+                artifact_title: format!("Shared Benchmark Corpus Asset #{}", bucket + 1),
+                artifact_kind: if bucket % 2 == 0 {
+                    DataCiteArtifactKind::Dataset
+                } else {
+                    DataCiteArtifactKind::Software
+                },
+                repository: "Zenodo".to_string(),
+                relation_type: "IsSupplementTo".to_string(),
+                citation_count: 14,
+                view_count: 420,
+                download_count: 185,
+            });
+            syn_bio.push(BioEntityBridgeLink {
+                entity_id: acc.clone(),
+                kind: BioEntityKind::UniProt,
+                label: format!("Conserved Regulatory Protein {}", acc),
+                uri: format!("https://www.uniprot.org/uniprotkb/{}", acc),
+                provider: "UniProtKB".to_string(),
+                section: "Results".to_string(),
+                mention_count: 3,
+                linked_pdb_ids: vec![pdb.clone()],
+                resolution_angstrom: None,
+            });
+            syn_bio.push(BioEntityBridgeLink {
+                entity_id: pdb.clone(),
+                kind: BioEntityKind::PdbStructure,
+                label: format!("Cryo-EM Complex {}", pdb),
+                uri: format!("https://www.rcsb.org/structure/{}", pdb),
+                provider: "RCSB PDB".to_string(),
+                section: "Methods".to_string(),
+                mention_count: 2,
+                linked_pdb_ids: Vec::new(),
+                resolution_angstrom: Some(2.45),
+            });
+            syn_bio.push(BioEntityBridgeLink {
+                entity_id: format!("GO:{:07}", 6410 + (bucket % 12)),
+                kind: BioEntityKind::GeneOntology,
+                label: "biological regulation pathway".to_string(),
+                uri: format!("http://purl.obolibrary.org/obo/GO_{:07}", 6410 + (bucket % 12)),
+                provider: "Europe PMC".to_string(),
+                section: "Abstract".to_string(),
+                mention_count: 4,
+                linked_pdb_ids: Vec::new(),
+                resolution_angstrom: None,
+            });
         }
 
         papers.push(PaperRecord {

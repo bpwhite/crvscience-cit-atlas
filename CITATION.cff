@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use Cit-Atlas in your research, please cite the software and its CRV Science Apps preprint below."
+title: "Cit-Atlas"
+version: "1.8.0"
+date-released: "2026-11-14"
+doi: "10.5281/zenodo.24222380"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.24222380"
+    description: "Zenodo Concept DOI for CRV Science Apps Preprint APP-PREPRINT-05"
+license: MIT
+repository-code: "https://github.com/bpwhite/crvscience-cit-atlas"
+url: "https://crvscience.com/apps"
+authors:
+  - family-names: "White"
+    given-names: "Bryan P."
+    affiliation: "CRV Science Labs"
+keywords:
+  - bibliometrics
+  - scientometrics
+  - citation-network
+  - louvain-clustering
+  - rate-limiting
+  - open-science
+  - rust
+preferred-citation:
+  type: article
+  title: "Cit-Atlas: Rate-Limited Multi-Provider Bibliometric Graph Harvesting, Louvain Community Detection, and Scientometric Analytics"
+  authors:
+    - family-names: "White"
+      given-names: "Bryan P."
+      affiliation: "CRV Science Labs"
+  doi: "10.5281/zenodo.24222380"
+  url: "https://crvscience.com/apps/preprints/cit-atlas-bibliometric-graph-engine"
+  collection-title: "CRV Science Apps Preprints"
+  year: 2026
+  notes: "APP-PREPRINT-05"

@@ -280,7 +280,7 @@ impl PoliteWebCrawler {
                     .map_err(|e| CrawlBlockReason::HttpError(format!("Decode error: {}", e)))?;
                 let low = body.to_ascii_lowercase();
                 let is_captcha = low.contains("gs_captcha_ccl")
-                    || low.contains("id="gs_captcha_f"")
+                    || low.contains("id=\"gs_captcha_f\"")
                     || low.contains("unusual traffic from your computer network");
                 if is_captcha {
                     log_global_crawl_outcome(
@@ -833,6 +833,7 @@ pub fn parse_google_scholar_html(html: &str) -> Result<Vec<ScholarSerpHit>, Craw
     let mut hits = Vec::new();
     let markers: Vec<usize> = html
         .match_indices("class=\"gs_r")
+        .filter(|&(idx, _)| matches!(html.as_bytes().get(idx + 11), Some(b' ') | Some(b'"')))
         .map(|(idx, _)| idx)
         .collect();
 

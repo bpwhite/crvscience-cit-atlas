@@ -4756,7 +4756,6 @@ impl CitAtlasApp {
             });
         });
     }
-}
 
 
     // ========================================================================
@@ -5306,6 +5305,7 @@ impl CitAtlasApp {
             }
         }
     }
+}
 
 pub fn run_native_gui() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

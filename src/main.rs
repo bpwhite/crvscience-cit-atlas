@@ -1382,9 +1382,14 @@ mod tests {
         assert_eq!(links[0].artifact_kind, DataCiteArtifactKind::Dataset);
 
         let (mut papers, _) = build_empirical_corpus();
+        let base_edges = synthesize_shared_artifact_edges(&papers).len();
         papers[0].datacite_links.push(links[0].clone());
         papers[1].datacite_links.push(links[0].clone());
-        assert_eq!(synthesize_shared_artifact_edges(&papers).len(), 1);
+        let after_edges = synthesize_shared_artifact_edges(&papers);
+        assert_eq!(after_edges.len(), base_edges + 1);
+        assert!(after_edges
+            .iter()
+            .any(|e| e.provenance.contains("10.5281/zenodo.778899")));
     }
 
     #[test]

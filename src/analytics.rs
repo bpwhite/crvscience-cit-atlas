@@ -389,6 +389,7 @@ pub fn compute_corpus_analytics(
                 }
             }
             let shared_bio_entity_peers = bio_peer_set.len();
+            let rec_disc = rec.disc;
 
             PaperMetrics {
                 idx: i,
@@ -424,14 +425,14 @@ pub fn compute_corpus_analytics(
                     .assignments
                     .get(i)
                     .and_then(|&cid| communities.louvain.clusters.get(cid))
-                    .map(|c| c.dominant_disc != rec.disc)
+                    .map(|c| c.dominant_disc != rec_disc)
                     .unwrap_or(false),
                 reclassified_infomap: communities
                     .infomap
                     .assignments
                     .get(i)
                     .and_then(|&mid| communities.infomap.clusters.get(mid))
-                    .map(|c| c.dominant_disc != rec.disc)
+                    .map(|c| c.dominant_disc != rec_disc)
                     .unwrap_or(false),
                 post_retraction_cites,
                 cites_retracted_count,

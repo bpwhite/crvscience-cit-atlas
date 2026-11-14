@@ -2732,7 +2732,7 @@ fn snowball_nasa_ads_bibcodes(
     let quoted: Vec<String> = ranked
         .into_iter()
         .take(max_neighbors.min(25))
-        .map(|(b, _)| format!(""{}"", b.replace('"', "")))
+        .map(|(b, _)| format!("\"{}\"", b.replace('"', "")))
         .collect();
     let solr_q = format!("bibcode:({})", quoted.join(" OR "));
     let url = format!(
