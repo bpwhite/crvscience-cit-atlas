@@ -37,7 +37,7 @@ Validation artifacts (`cit_atlas_validation_summary.json` and `citation_network_
 ```bibtex
 @article{white2026citatlas,
   author  = {Bryan P. White},
-  title   = {Cit-Atlas: Rate-Limited Multi-Provider Bibliometric Graph Harvesting, Louvain Community Detection, and Scientometric Analytics},
+  title   = {Cit-Atlas: Mapping Citation Networks and Research Impact Across Scientific Papers},
   year    = {2026},
   journal = {CRV Science Apps Preprints},
   note    = {APP-PREPRINT-05, v1.8.0},
