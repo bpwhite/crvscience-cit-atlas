@@ -1,5 +1,7 @@
 # CitAtlas (`cit-atlas` v1.8.0)
 
+![Cit-Atlas Headless Workbench](validation/headless_screenshot.png)
+
 Native safe-Rust (`#![forbid(unsafe_code)]`, 17 modules, 30 unit tests) desktop (`eframe`/`egui` + `wgpu` `24.0` WGSL compute/instanced renderer) and `clap` CLI scientometrics workstation.
 
 ## Core Capabilities

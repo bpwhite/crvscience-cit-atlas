@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -182,17 +197,6 @@ pub struct CitAtlasApp {
 
 impl CitAtlasApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(13, 18, 30);
-        visuals.window_fill = Color32::from_rgb(17, 24, 39);
-        cc.egui_ctx.set_visuals(visuals);
-
-        let (raw_papers, raw_edges) = build_empirical_corpus();
-        let params = AnalyticsParams::default();
-        let analytics = compute_corpus_analytics(&raw_papers, &raw_edges, &params);
-        let selected_window_idx = analytics.windows.len().saturating_sub(1);
-        let (worker_tx, worker_rx) = mpsc::channel();
-
         let mut use_wgpu_pipeline = false;
         let mut wgpu_adapter_label = "CPU Painter Fallback".to_string();
         if let Some(wgpu_state) = cc.wgpu_render_state.as_ref() {
@@ -208,6 +212,24 @@ impl CitAtlasApp {
                 ));
             use_wgpu_pipeline = true;
         }
+        Self::new_with_ctx(&cc.egui_ctx, use_wgpu_pipeline, wgpu_adapter_label)
+    }
+
+    pub fn new_with_ctx(
+        ctx: &egui::Context,
+        use_wgpu_pipeline: bool,
+        wgpu_adapter_label: String,
+    ) -> Self {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = Color32::from_rgb(13, 18, 30);
+        visuals.window_fill = Color32::from_rgb(17, 24, 39);
+        ctx.set_visuals(visuals);
+
+        let (raw_papers, raw_edges) = build_empirical_corpus();
+        let params = AnalyticsParams::default();
+        let analytics = compute_corpus_analytics(&raw_papers, &raw_edges, &params);
+        let selected_window_idx = analytics.windows.len().saturating_sub(1);
+        let (worker_tx, worker_rx) = mpsc::channel();
 
         let mut app = Self {
             raw_papers,
@@ -873,6 +895,49 @@ impl CitAtlasApp {
 
 impl eframe::App for CitAtlasApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
+}
+
+impl CitAtlasApp {
+    pub fn configure_screenshot_state(&mut self) {
+        self.domain = ActiveDomain::NetworkGraphViewer;
+        self.graph_viewer.layout = ViewerLayoutPreset::ForceAtlas2;
+        self.graph_viewer.color_by = NodeColorEncoding::LouvainCommunity;
+        self.graph_viewer.show_labels = true;
+        self.graph_viewer.physics_running = false;
+        self.show_dossier_panel = true;
+        self.focused_paper_id = "shannon1948".to_string();
+        self.recompute_layout();
+        self.graph_viewer
+            .sync_with_analytics(&self.analytics, &self.focused_paper_id);
+        for _ in 0..12 {
+            self.graph_viewer.step_physics(&self.analytics);
+        }
+        self.rebuild_cpu_pick_grid();
+        self.gpu_scene_revision = self.gpu_scene_revision.wrapping_add(1);
+        self.gpu_step_once = true;
+    }
+
+    pub fn configure_screenshot_view(&mut self, view: u8) {
+        match view {
+            2 => {
+                self.domain = ActiveDomain::CommunitiesLouvainInfomap;
+                self.focused_paper_id = "rosvall2008".to_string();
+                self.show_dossier_panel = true;
+            }
+            3 => {
+                self.domain = ActiveDomain::VelocityAndAwakening;
+                self.vel_metric = VelocityPlotMetric::DecayVelocity;
+                self.show_awakening_quadrant = false;
+                self.focused_paper_id = "ke2015".to_string();
+                self.show_dossier_panel = true;
+            }
+            _ => self.configure_screenshot_state(),
+        }
+    }
+
+    pub fn update_ui(&mut self, ctx: &egui::Context) {
         self.poll_worker_events(ctx);
 
         // Top Navigation & Global Parameter Ribbon
@@ -3286,9 +3351,10 @@ impl CitAtlasApp {
         rows.sort_by(|a, b| b.v_exp.partial_cmp(&a.v_exp).unwrap_or(std::cmp::Ordering::Equal));
 
         ui.push_id("velocity_ledger_scroll", |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::both().show(ui, |ui| {
                 egui::Grid::new("velocity_ledger_grid")
                     .striped(true)
+                    .spacing([6.0, 4.0])
                     .num_columns(10)
                     .show(ui, |ui| {
                         ui.strong("Plot");
@@ -3315,7 +3381,12 @@ impl CitAtlasApp {
                                     self.compared_ids.push(p.record.id.clone());
                                 }
                             }
-                            if ui.link(&p.record.title).clicked() {
+                            let short_title = if p.record.title.chars().count() > 38 {
+                                format!("{}...", p.record.title.chars().take(35).collect::<String>())
+                            } else {
+                                p.record.title.clone()
+                            };
+                            if ui.link(short_title).on_hover_text(&p.record.title).clicked() {
                                 self.focused_paper_id = p.record.id.clone();
                                 self.show_dossier_panel = true;
                             }
@@ -5320,4 +5391,273 @@ pub fn run_native_gui() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(CitAtlasApp::new(cc)))),
     )
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct ThreadWaker(std::thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+fn write_rgba_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> std::io::Result<()> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if (crc & 1) != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+    fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(tag);
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&crc32(&out[start..]).to_be_bytes());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let row_bytes = width as usize * 4;
+    let mut raw = Vec::with_capacity(height as usize * (1 + row_bytes));
+    for row in rgba.chunks_exact(row_bytes) {
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+    let (mut s1, mut s2) = (1u32, 0u32);
+    for &b in &raw {
+        s1 = (s1 + b as u32) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    let mut zlib = Vec::with_capacity(raw.len() + 32);
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    let chunks: Vec<&[u8]> = if raw.is_empty() { vec![&[]] } else { raw.chunks(65535).collect() };
+    for (i, chunk) in chunks.iter().enumerate() {
+        zlib.push(if i + 1 == chunks.len() { 1 } else { 0 });
+        let len = chunk.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(chunk);
+    }
+    zlib.extend_from_slice(&((s2 << 16) | s1).to_be_bytes());
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    let mut png = Vec::with_capacity(zlib.len() + 64);
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    push_chunk(&mut png, b"IHDR", &ihdr);
+    push_chunk(&mut png, b"IDAT", &zlib);
+    push_chunk(&mut png, b"IEND", &[]);
+    std::fs::write(path, png)
+}
+
+pub fn capture_headless_screenshot(
+    out_png: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    capture_headless_screenshot_view(out_png, 1)
+}
+
+pub fn capture_headless_screenshot_view(
+    out_png: &std::path::Path,
+    view: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use eframe::{egui_wgpu, wgpu};
+
+    const W: u32 = 1600;
+    const H: u32 = 1000;
+
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .ok_or("No suitable wgpu adapter found for offscreen capture")?;
+
+    let info = adapter.get_info();
+    let adapter_label = format!("wgpu {:?} · {}", info.backend, info.name);
+
+    let (device, queue) = block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("cit_atlas_headless_device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits {
+                max_texture_dimension_2d: 8192,
+                ..wgpu::Limits::default()
+            },
+            memory_hints: wgpu::MemoryHints::default(),
+        },
+        None,
+    ))?;
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+    renderer
+        .callback_resources
+        .insert(WgpuGraphPipelineResources::new(&device, format));
+
+    let tex_extent = wgpu::Extent3d {
+        width: W,
+        height: H,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("cit_atlas_offscreen_target"),
+        size: tex_extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let tex_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bytes_per_row = W * 4;
+    let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cit_atlas_offscreen_readback"),
+        size: (bytes_per_row * H) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let ctx = egui::Context::default();
+    ctx.set_pixels_per_point(1.0);
+    let mut app = CitAtlasApp::new_with_ctx(&ctx, true, adapter_label);
+    app.configure_screenshot_view(view);
+
+    for frame_idx in 0..4u32 {
+        let mut raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(W as f32, H as f32),
+            )),
+            time: Some(frame_idx as f64 * 0.016),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        raw_input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(1.0);
+
+        let full_output = ctx.run(raw_input, |ctx| app.update_ui(ctx));
+        let clipped_primitives =
+            ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [W, H],
+            pixels_per_point: 1.0,
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cit_atlas_offscreen_encoder"),
+        });
+        for (id, image_delta) in &full_output.textures_delta.set {
+            renderer.update_texture(&device, &queue, *id, image_delta);
+        }
+        let user_cmds = renderer.update_buffers(
+            &device,
+            &queue,
+            &mut encoder,
+            &clipped_primitives,
+            &screen_descriptor,
+        );
+
+        let bg = ctx.style().visuals.panel_fill.to_normalized_gamma_f32();
+        {
+            let mut rpass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("cit_atlas_offscreen_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &tex_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: bg[0] as f64,
+                                g: bg[1] as f64,
+                                b: bg[2] as f64,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                })
+                .forget_lifetime();
+            renderer.render(&mut rpass, &clipped_primitives, &screen_descriptor);
+        }
+
+        if frame_idx == 3 {
+            encoder.copy_texture_to_buffer(
+                texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback_buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(H),
+                    },
+                },
+                tex_extent,
+            );
+        }
+
+        queue.submit(user_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        let _ = device.poll(wgpu::Maintain::Wait);
+        for id in &full_output.textures_delta.free {
+            renderer.free_texture(id);
+        }
+    }
+
+    let slice = readback_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    let _ = device.poll(wgpu::Maintain::Wait);
+    rx.recv()??;
+    let rgba = slice.get_mapped_range().to_vec();
+    readback_buf.unmap();
+
+    write_rgba_png(out_png, W, H, &rgba)?;
+    println!(
+        "Saved offscreen GPU screenshot ({}x{} RGBA) to {}",
+        W,
+        H,
+        out_png.display()
+    );
+    Ok(())
 }

@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
@@ -17,7 +32,7 @@ use cit_atlas::export::{
 use cit_atlas::graph_viewer::{
     compute_preset_positions, NodeColorEncoding, ViewerLayoutPreset,
 };
-use cit_atlas::gui::run_native_gui;
+use cit_atlas::gui::{capture_headless_screenshot_view, run_native_gui};
 use cit_atlas::integrity_bridges::run_full_corpus_screening;
 use cit_atlas::models::{
     AnalyticsParams, CrawlOptions, SearchProvidersConfig, SearchRequest, SyntheticRegime,
@@ -35,6 +50,14 @@ use cit_atlas::storage::{import_corpus_file, LedgerStore};
     about = "Native Rust Citations Analytics Workstation with OpenAIRE Graph, INSPIRE-HEP & NASA ADS Harvesters, 24-Domain Token-Bucket Rate Limiter & Crawl Audit Log, wgpu WGSL 50,000+ Node Graph Renderer, Bio/DataCite Bridges & 10-Table CSV Suite"
 )]
 struct Cli {
+    /// Render a 1600x1000 offscreen GPU screenshot to a PNG file without opening a GUI window
+    #[arg(long, global = true, value_name = "OUT_PNG")]
+    screenshot: Option<PathBuf>,
+
+    /// Select which workbench domain view to capture with --screenshot (1, 2, or 3)
+    #[arg(long, global = true, default_value_t = 1, value_name = "VIEW")]
+    screenshot_view: u8,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -432,6 +455,13 @@ fn load_corpus_from_sources(
 
 fn main() {
     let cli = Cli::parse();
+    if let Some(out_png) = cli.screenshot {
+        if let Err(e) = capture_headless_screenshot_view(&out_png, cli.screenshot_view) {
+            eprintln!("Screenshot error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
     match cli.command {
         None | Some(Commands::Gui) => {
             if let Err(e) = run_native_gui() {
