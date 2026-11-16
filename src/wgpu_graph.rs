@@ -1577,7 +1577,7 @@ impl egui_wgpu::CallbackTrait for WgpuGraphCallback {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        egui_encoder: &mut wgpu::CommandEncoder,
+        _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(res) = callback_resources.get_mut::<WgpuGraphPipelineResources>() else {
@@ -1624,8 +1624,11 @@ impl egui_wgpu::CallbackTrait for WgpuGraphCallback {
         // 2. Upload topology & node states only when scene revision changed
         if let Some(ref up) = self.upload {
             if up.revision != res.uploaded_revision {
-                if res.readback_in_flight.load(Ordering::SeqCst) {
+                if res.readback_in_flight.load(Ordering::SeqCst)
+                    || res.readback_ready.load(Ordering::SeqCst)
+                {
                     res.readback_buf.unmap();
+                    let _ = device.poll(wgpu::Maintain::Poll);
                     res.readback_in_flight.store(false, Ordering::SeqCst);
                     res.readback_ready.store(false, Ordering::SeqCst);
                 }
@@ -1659,26 +1662,31 @@ impl egui_wgpu::CallbackTrait for WgpuGraphCallback {
         queue.write_buffer(&res.sim_uniform_buf, 0, &encode_sim_uniforms_bytes(&sim_payload));
         queue.write_buffer(&res.cam_uniform_buf, 0, &encode_camera_uniforms_bytes(&self.cam));
 
-        // 4. Dispatch 3-pass WGSL Compute Pipeline when simulation step or node drag is active
+        // 4. Dispatch 3-pass WGSL Compute Pipeline on a dedicated encoder so
+        // `queue.submit` runs strictly before `map_async` is invoked on `readback_buf`.
         if res.node_count > 0 && (sim_payload.run_step == 1 || sim_payload.dragged_idx >= 0) {
+            let mut compute_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("CitAtlas Dedicated Compute & Readback Encoder"),
+            });
             let clear_groups = ((GRID_CELLS as u32) + 255) / 256;
             let node_groups = (res.node_count + 255) / 256;
 
-            let mut cpass = egui_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("CitAtlas WGSL Graph Force Pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_bind_group(0, &res.compute_bg, &[]);
+            {
+                let mut cpass = compute_enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("CitAtlas WGSL Graph Force Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_bind_group(0, &res.compute_bg, &[]);
 
-            cpass.set_pipeline(&res.clear_pipeline);
-            cpass.dispatch_workgroups(clear_groups, 1, 1);
+                cpass.set_pipeline(&res.clear_pipeline);
+                cpass.dispatch_workgroups(clear_groups, 1, 1);
 
-            cpass.set_pipeline(&res.bin_pipeline);
-            cpass.dispatch_workgroups(node_groups, 1, 1);
+                cpass.set_pipeline(&res.bin_pipeline);
+                cpass.dispatch_workgroups(node_groups, 1, 1);
 
-            cpass.set_pipeline(&res.force_pipeline);
-            cpass.dispatch_workgroups(node_groups, 1, 1);
-            drop(cpass);
+                cpass.set_pipeline(&res.force_pipeline);
+                cpass.dispatch_workgroups(node_groups, 1, 1);
+            }
 
             res.frame_counter += 1;
             if let Ok(mut mir) = self.mirror.lock() {
@@ -1687,53 +1695,44 @@ impl egui_wgpu::CallbackTrait for WgpuGraphCallback {
                 mir.active_edge_count = res.edge_count as usize;
             }
 
-            // Schedule async non-blocking readback every 6th physics frame
-            if res.frame_counter % 6 == 0 && !res.readback_in_flight.load(Ordering::SeqCst) {
+            // Copy to readback staging buffer on every 6th physics frame
+            let mut readback_bytes: u64 = 0;
+            if res.frame_counter % 6 == 0
+                && !res.readback_in_flight.load(Ordering::SeqCst)
+                && !res.readback_ready.load(Ordering::SeqCst)
+            {
                 let copy_bytes = (res.node_count as u64) * 48;
-                egui_encoder.copy_buffer_to_buffer(
+                compute_enc.copy_buffer_to_buffer(
                     &res.node_buf,
                     0,
                     &res.readback_buf,
                     0,
                     copy_bytes,
                 );
+                readback_bytes = copy_bytes;
+            }
+
+            queue.submit(std::iter::once(compute_enc.finish()));
+
+            // Only map readback buffer AFTER `compute_enc` has been submitted to `queue`
+            if readback_bytes > 0 && !res.readback_in_flight.swap(true, Ordering::SeqCst) {
+                let ready_flag = Arc::clone(&res.readback_ready);
+                let inflight_flag = Arc::clone(&res.readback_in_flight);
+                res.readback_buf
+                    .slice(0..readback_bytes)
+                    .map_async(wgpu::MapMode::Read, move |map_res| {
+                        if map_res.is_ok() {
+                            ready_flag.store(true, Ordering::SeqCst);
+                        } else {
+                            inflight_flag.store(false, Ordering::SeqCst);
+                        }
+                    });
             }
         } else if let Ok(mut mir) = self.mirror.lock() {
             mir.active_node_count = res.node_count as usize;
             mir.active_edge_count = res.edge_count as usize;
         }
 
-        Vec::new()
-    }
-
-    fn finish_prepare(
-        &self,
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut egui_wgpu::CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let Some(res) = callback_resources.get_mut::<WgpuGraphPipelineResources>() else {
-            return Vec::new();
-        };
-        if res.node_count > 0
-            && res.frame_counter > 0
-            && res.frame_counter % 6 == 0
-            && !res.readback_in_flight.swap(true, Ordering::SeqCst)
-        {
-            let byte_len = (res.node_count as u64) * 48;
-            let ready_flag = Arc::clone(&res.readback_ready);
-            let inflight_flag = Arc::clone(&res.readback_in_flight);
-            res.readback_buf
-                .slice(0..byte_len)
-                .map_async(wgpu::MapMode::Read, move |map_res| {
-                    if map_res.is_ok() {
-                        ready_flag.store(true, Ordering::SeqCst);
-                    } else {
-                        inflight_flag.store(false, Ordering::SeqCst);
-                    }
-                });
-        }
         Vec::new()
     }
 
@@ -1759,5 +1758,258 @@ impl egui_wgpu::CallbackTrait for WgpuGraphCallback {
 
         render_pass.set_pipeline(&res.node_render_pipeline);
         render_pass.draw(0..6, 0..res.node_count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui_wgpu::CallbackTrait;
+
+    fn block_on_test<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Wake, Waker};
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return out,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_drag_frames_with_mod6_readbacks_do_not_panic() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let Some(adapter) = block_on_test(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })) else {
+            return;
+        };
+        let Ok((device, queue)) = block_on_test(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("cit_atlas_drag_test_device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+            },
+            None,
+        )) else {
+            return;
+        };
+
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(WgpuGraphPipelineResources::new(&device, format));
+
+        let n_nodes = 12usize;
+        let gpu_nodes: Vec<GpuNodeRecord> = (0..n_nodes)
+            .map(|i| {
+                let ang = (i as f32) * std::f32::consts::TAU / (n_nodes as f32);
+                let pos = [0.45 * ang.cos(), 0.45 * ang.sin()];
+                GpuNodeRecord {
+                    pos,
+                    vel: [0.0, 0.0],
+                    anchor: pos,
+                    radius: 7.0,
+                    rgba_packed: pack_rgba_u32(56, 189, 248, 255),
+                    flags: 0,
+                    degree: 2.0,
+                    pad0: 0.0,
+                    pad1: 0.0,
+                }
+            })
+            .collect();
+        let gpu_edges: Vec<GpuEdgeRecord> = (0..n_nodes)
+            .map(|i| GpuEdgeRecord {
+                src_idx: i as u32,
+                dst_idx: ((i + 1) % n_nodes) as u32,
+                rgba_packed: pack_rgba_u32(148, 163, 184, 180),
+                eb_encoded: 0.5,
+            })
+            .collect();
+        let mut csr_off = Vec::with_capacity(n_nodes + 1);
+        let mut csr_nbr = Vec::with_capacity(n_nodes * 2);
+        for i in 0..n_nodes {
+            csr_off.push(csr_nbr.len() as u32);
+            csr_nbr.push(((i + 1) % n_nodes) as u32);
+            csr_nbr.push(((i + n_nodes - 1) % n_nodes) as u32);
+        }
+        csr_off.push(csr_nbr.len() as u32);
+
+        let initial_upload = PreparedGpuUpload {
+            revision: 1,
+            node_bytes: Arc::new(encode_gpu_nodes_bytes(&gpu_nodes)),
+            edge_bytes: Arc::new(encode_gpu_edges_bytes(&gpu_edges)),
+            csr_offsets_bytes: Arc::new(encode_u32_slice_bytes(&csr_off)),
+            csr_neighbors_bytes: Arc::new(encode_u32_slice_bytes(&csr_nbr)),
+            node_count: n_nodes,
+            edge_count: gpu_edges.len(),
+            csr_neighbor_count: csr_nbr.len(),
+        };
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("drag_test_target"),
+            size: wgpu::Extent3d {
+                width: 640,
+                height: 480,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mirror = Arc::new(Mutex::new(GpuReadbackMirror::default()));
+        let screen_desc = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [640, 480],
+            pixels_per_point: 1.0,
+        };
+
+        // Drive 36 consecutive frames while dragging node 0 across mod-6 readback boundaries
+        // (frames 6, 12, 18, 24, 30, 36), with physics paused so drag alone activates compute.
+        for frame in 0..36u32 {
+            let drag_x = -0.3 + (frame as f32) * 0.02;
+            let drag_y = 0.25 - (frame as f32) * 0.012;
+            let cb = WgpuGraphCallback {
+                upload: if frame == 0 { Some(initial_upload.clone()) } else { None },
+                sim: SimUniformsPayload {
+                    node_count: n_nodes as u32,
+                    grid_dim: GRID_DIM,
+                    super_dim: SUPER_DIM,
+                    run_step: 0,
+                    world_extent: WORLD_EXTENT,
+                    repulsion_k: 0.45,
+                    spring_k: 0.70,
+                    gravity_k: 0.15,
+                    cohesion_k: 0.35,
+                    damping: 0.85,
+                    ideal_len: 0.28,
+                    max_step: 0.032,
+                    dragged_idx: 0,
+                    drag_x,
+                    drag_y,
+                    pad0: 0.0,
+                },
+                cam: CameraUniformsPayload {
+                    pan_x: 0.0,
+                    pan_y: 0.0,
+                    zoom: 1.0,
+                    aspect: 640.0 / 480.0,
+                    viewport_w: 640.0,
+                    viewport_h: 480.0,
+                    min_edge_eb: 0.0,
+                    edge_alpha_scale: 0.85,
+                    node_scale: 1.0,
+                    show_arrows: 1,
+                    curved_edges: 0,
+                    hovered_idx: 0,
+                },
+                mirror: Arc::clone(&mirror),
+            };
+
+            let mut egui_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("drag_test_frame_enc"),
+            });
+            let extra = cb.prepare(&device, &queue, &screen_desc, &mut egui_enc, &mut resources);
+            {
+                let mut rpass = egui_enc
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("drag_test_rpass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    })
+                    .forget_lifetime();
+                let paint_info = egui::PaintCallbackInfo {
+                    viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(640.0, 480.0)),
+                    clip_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(640.0, 480.0)),
+                    pixels_per_point: 1.0,
+                    screen_size_px: [640, 480],
+                };
+                cb.paint(paint_info, &mut rpass, &resources);
+            }
+            let mut bufs = extra;
+            bufs.push(egui_enc.finish());
+            queue.submit(bufs);
+            let _ = device.poll(wgpu::Maintain::Wait);
+        }
+
+        // One final poll-harvest prepare frame after frame 36 readback completes
+        let mut final_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("drag_test_final_harvest"),
+        });
+        let final_cb = WgpuGraphCallback {
+            upload: None,
+            sim: SimUniformsPayload {
+                node_count: n_nodes as u32,
+                grid_dim: GRID_DIM,
+                super_dim: SUPER_DIM,
+                run_step: 0,
+                world_extent: WORLD_EXTENT,
+                repulsion_k: 0.45,
+                spring_k: 0.70,
+                gravity_k: 0.15,
+                cohesion_k: 0.35,
+                damping: 0.85,
+                ideal_len: 0.28,
+                max_step: 0.032,
+                dragged_idx: -1,
+                drag_x: 0.0,
+                drag_y: 0.0,
+                pad0: 0.0,
+            },
+            cam: CameraUniformsPayload {
+                pan_x: 0.0,
+                pan_y: 0.0,
+                zoom: 1.0,
+                aspect: 640.0 / 480.0,
+                viewport_w: 640.0,
+                viewport_h: 480.0,
+                min_edge_eb: 0.0,
+                edge_alpha_scale: 0.85,
+                node_scale: 1.0,
+                show_arrows: 1,
+                curved_edges: 0,
+                hovered_idx: -1,
+            },
+            mirror: Arc::clone(&mirror),
+        };
+        let _ = final_cb.prepare(&device, &queue, &screen_desc, &mut final_enc, &mut resources);
+
+        let mir = mirror.lock().unwrap();
+        assert_eq!(mir.gpu_frames_dispatched, 36);
+        assert_eq!(mir.coords.len(), n_nodes);
+        assert!(
+            (mir.coords[0][0] - (-0.3 + 35.0 * 0.02)).abs() < 0.05,
+            "Dragged node 0 x coordinate should track final drag target, got {:?}",
+            mir.coords[0]
+        );
     }
 }

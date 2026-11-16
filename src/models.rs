@@ -915,6 +915,78 @@ impl SearchProvidersConfig {
             datacite: has(&["datacite", "zenodo", "dryad", "figshare"]),
         }
     }
+
+    pub fn all_open_apis() -> Self {
+        Self {
+            openalex: true,
+            semantic_scholar: true,
+            crossref: true,
+            arxiv: true,
+            openaire: true,
+            inspire_hep: false,
+            nasa_ads: false,
+            google_scholar: false,
+            pubmed: true,
+            europe_pmc: true,
+            dblp: true,
+            biorxiv_medrxiv: true,
+            datacite: true,
+        }
+    }
+
+    pub fn biomed_preset() -> Self {
+        Self {
+            openalex: true,
+            semantic_scholar: true,
+            crossref: true,
+            arxiv: false,
+            openaire: false,
+            inspire_hep: false,
+            nasa_ads: false,
+            google_scholar: false,
+            pubmed: true,
+            europe_pmc: true,
+            dblp: false,
+            biorxiv_medrxiv: true,
+            datacite: true,
+        }
+    }
+
+    pub fn cs_ai_preset() -> Self {
+        Self {
+            openalex: true,
+            semantic_scholar: true,
+            crossref: true,
+            arxiv: true,
+            openaire: false,
+            inspire_hep: false,
+            nasa_ads: false,
+            google_scholar: false,
+            pubmed: false,
+            europe_pmc: false,
+            dblp: true,
+            biorxiv_medrxiv: false,
+            datacite: true,
+        }
+    }
+
+    pub fn physics_astro_preset() -> Self {
+        Self {
+            openalex: true,
+            semantic_scholar: false,
+            crossref: true,
+            arxiv: true,
+            openaire: true,
+            inspire_hep: true,
+            nasa_ads: true,
+            google_scholar: false,
+            pubmed: false,
+            europe_pmc: false,
+            dblp: false,
+            biorxiv_medrxiv: false,
+            datacite: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -979,6 +1051,18 @@ pub struct SearchRequest {
     pub snowball_hops: u8,
     #[serde(default)]
     pub crawl: CrawlOptions,
+    #[serde(default)]
+    pub authors: String,
+    #[serde(default)]
+    pub publication_venue: String,
+    #[serde(default)]
+    pub title_words: String,
+    #[serde(default)]
+    pub keywords_all: String,
+    #[serde(default)]
+    pub exclude_words: String,
+    #[serde(default)]
+    pub identifier_lookup: String,
 }
 
 impl Default for SearchRequest {
@@ -993,6 +1077,12 @@ impl Default for SearchRequest {
             polite_email: "research@crvscience.com".to_string(),
             snowball_hops: 1,
             crawl: CrawlOptions::default(),
+            authors: String::new(),
+            publication_venue: String::new(),
+            title_words: String::new(),
+            keywords_all: String::new(),
+            exclude_words: String::new(),
+            identifier_lookup: String::new(),
         }
     }
 }

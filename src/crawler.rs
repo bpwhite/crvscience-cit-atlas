@@ -30,7 +30,10 @@ use crate::rate_limiter::{
     acquire_domain_permit_blocking, apply_global_robots_crawl_delay, log_global_crawl_outcome,
     parse_robots_crawl_delay_ms, AcquirePermit, CrawlAuditOutcome,
 };
-use crate::search_providers::{normalize_doi, percent_encode};
+use crate::search_providers::{
+    build_effective_query, normalize_doi, parse_identifier_lookup, percent_encode,
+    IdentifierLookupKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrawlBlockReason {
@@ -636,15 +639,16 @@ pub fn crawl_google_scholar(
                 break;
             }
             let start = page * 10;
+            let eff_q = build_effective_query(req);
             let path_and_query = if !req.crawl.scholar_cites_cluster_id.trim().is_empty() {
                 let mut pq = format!(
                     "/scholar?hl=en&cites={}&start={}",
                     percent_encode(req.crawl.scholar_cites_cluster_id.trim()),
                     start
                 );
-                if !req.query.trim().is_empty() {
+                if !eff_q.trim().is_empty() {
                     pq.push_str("&as_epq=");
-                    pq.push_str(&percent_encode(req.query.trim()));
+                    pq.push_str(&percent_encode(eff_q.trim()));
                 }
                 if let Some(ymin) = req.year_min {
                     pq.push_str(&format!("&as_ylo={}", ymin));
@@ -656,7 +660,7 @@ pub fn crawl_google_scholar(
             } else {
                 let mut pq = format!(
                     "/scholar?hl=en&q={}&start={}",
-                    percent_encode(req.query.trim()),
+                    percent_encode(eff_q.trim()),
                     start
                 );
                 if let Some(ymin) = req.year_min {
@@ -735,8 +739,9 @@ fn crawl_google_scholar_serpapi(
             url.push_str("&cites=");
             url.push_str(&percent_encode(req.crawl.scholar_cites_cluster_id.trim()));
         } else {
+            let eff_q = build_effective_query(req);
             url.push_str("&q=");
-            url.push_str(&percent_encode(req.query.trim()));
+            url.push_str(&percent_encode(eff_q.trim()));
         }
         if let Some(ymin) = req.year_min {
             url.push_str(&format!("&as_ylo={}", ymin));
@@ -1032,12 +1037,38 @@ fn scholar_hit_to_paper_record(
 // ============================================================================
 // 2. PUBMED / NCBI ENTREZ E-UTILITIES CRAWLER (esearch + esummary + elink)
 // ============================================================================
-pub fn crawl_pubmed_entrez(
-    crawler: &PoliteWebCrawler,
-    req: &SearchRequest,
-) -> Result<Vec<PaperRecord>, String> {
-    let limit = req.max_per_provider.clamp(1, 100);
-    let mut term = req.query.trim().to_string();
+pub fn build_pubmed_term(req: &SearchRequest) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match parse_identifier_lookup(&req.identifier_lookup) {
+        Some(IdentifierLookupKind::Pmid(pmid)) => parts.push(format!("{}[uid]", pmid)),
+        Some(IdentifierLookupKind::Doi(doi)) => parts.push(format!("\"{}\"[DOI]", doi)),
+        Some(IdentifierLookupKind::Orcid(orcid)) => parts.push(format!("{}[auid]", orcid)),
+        _ => {}
+    }
+    if !req.title_words.trim().is_empty() {
+        parts.push(format!("({})[Title]", req.title_words.trim()));
+    }
+    if !req.authors.trim().is_empty() {
+        parts.push(format!("{}[Author]", req.authors.trim()));
+    }
+    if !req.publication_venue.trim().is_empty() {
+        parts.push(format!("\"{}\"[Journal]", req.publication_venue.trim()));
+    }
+    if !req.query.trim().is_empty() {
+        parts.push(format!("({})", req.query.trim()));
+    }
+    if !req.keywords_all.trim().is_empty() {
+        parts.push(format!("({})", req.keywords_all.trim()));
+    }
+    let mut term = if parts.is_empty() {
+        build_effective_query(req)
+    } else {
+        parts.join(" AND ")
+    };
+    let excludes: Vec<&str> = req.exclude_words.split_whitespace().collect();
+    if !excludes.is_empty() {
+        term = format!("({}) NOT ({})", term, excludes.join(" OR "));
+    }
     if let (Some(ymin), Some(ymax)) = (req.year_min, req.year_max) {
         term = format!("({}) AND {}:{}[dp]", term, ymin, ymax);
     } else if let Some(ymin) = req.year_min {
@@ -1045,6 +1076,15 @@ pub fn crawl_pubmed_entrez(
     } else if let Some(ymax) = req.year_max {
         term = format!("({}) AND 1800:{}[dp]", term, ymax);
     }
+    term
+}
+
+pub fn crawl_pubmed_entrez(
+    crawler: &PoliteWebCrawler,
+    req: &SearchRequest,
+) -> Result<Vec<PaperRecord>, String> {
+    let limit = req.max_per_provider.clamp(1, 100);
+    let term = build_pubmed_term(req);
 
     let mut search_url = format!(
         "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&retmode=json&retmax={}&sort=relevance&email={}&term={}",
@@ -1255,18 +1295,53 @@ pub fn crawl_pubmed_entrez(
 // ============================================================================
 // 3. EUROPE PMC REST + CITATION GRAPH CRAWLER
 // ============================================================================
-pub fn crawl_europe_pmc(
-    crawler: &PoliteWebCrawler,
-    req: &SearchRequest,
-) -> Result<Vec<PaperRecord>, String> {
-    let page_size = req.max_per_provider.clamp(1, 100);
-    let mut query = req.query.trim().to_string();
+pub fn build_europe_pmc_query(req: &SearchRequest) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match parse_identifier_lookup(&req.identifier_lookup) {
+        Some(IdentifierLookupKind::Pmid(pmid)) => parts.push(format!("EXT_ID:{}", pmid)),
+        Some(IdentifierLookupKind::Doi(doi)) => parts.push(format!("DOI:\"{}\"", doi)),
+        Some(IdentifierLookupKind::Orcid(orcid)) => parts.push(format!("AUTHORID:\"{}\"", orcid)),
+        _ => {}
+    }
+    if !req.title_words.trim().is_empty() {
+        parts.push(format!("TITLE:\"{}\"", req.title_words.trim()));
+    }
+    if !req.authors.trim().is_empty() {
+        parts.push(format!("AUTH:\"{}\"", req.authors.trim()));
+    }
+    if !req.publication_venue.trim().is_empty() {
+        parts.push(format!("JOURNAL:\"{}\"", req.publication_venue.trim()));
+    }
+    if !req.query.trim().is_empty() {
+        parts.push(format!("({})", req.query.trim()));
+    }
+    if !req.keywords_all.trim().is_empty() {
+        parts.push(format!("({})", req.keywords_all.trim()));
+    }
+    let mut query = if parts.is_empty() {
+        build_effective_query(req)
+    } else {
+        parts.join(" AND ")
+    };
+    let excludes: Vec<&str> = req.exclude_words.split_whitespace().collect();
+    if !excludes.is_empty() {
+        query = format!("({}) NOT ({})", query, excludes.join(" OR "));
+    }
     if let (Some(ymin), Some(ymax)) = (req.year_min, req.year_max) {
         query = format!("({}) AND (PUB_YEAR:[{} TO {}])", query, ymin, ymax);
     }
     if req.oa_only {
         query = format!("({}) AND (OPEN_ACCESS:y)", query);
     }
+    query
+}
+
+pub fn crawl_europe_pmc(
+    crawler: &PoliteWebCrawler,
+    req: &SearchRequest,
+) -> Result<Vec<PaperRecord>, String> {
+    let page_size = req.max_per_provider.clamp(1, 100);
+    let query = build_europe_pmc_query(req);
 
     let url = format!(
         "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={}&resultType=core&pageSize={}&format=json",
@@ -1411,9 +1486,10 @@ pub fn crawl_dblp(
     req: &SearchRequest,
 ) -> Result<Vec<PaperRecord>, String> {
     let limit = req.max_per_provider.clamp(1, 100);
+    let eff_q = build_effective_query(req);
     let url = format!(
         "https://dblp.org/search/publ/api?q={}&h={}&format=json",
-        percent_encode(req.query.trim()),
+        percent_encode(eff_q.trim()),
         limit
     );
     let val = crawler.get_json(&url)?;
@@ -1565,8 +1641,8 @@ pub fn crawl_biorxiv_medrxiv(
     crawler: &PoliteWebCrawler,
     req: &SearchRequest,
 ) -> Result<Vec<PaperRecord>, String> {
-    let query_tokens: Vec<String> = req
-        .query
+    let eff_q = build_effective_query(req);
+    let query_tokens: Vec<String> = eff_q
         .split_whitespace()
         .map(|t| t.trim().to_ascii_lowercase())
         .filter(|t| t.len() >= 3)

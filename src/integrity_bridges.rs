@@ -664,9 +664,10 @@ pub fn search_datacite_works(
     req: &SearchRequest,
 ) -> Result<Vec<PaperRecord>, String> {
     let limit = req.max_per_provider.clamp(1, 100);
+    let eff_q = crate::search_providers::build_effective_query(req);
     let url = format!(
         "https://api.datacite.org/dois?query={}&page%5Bsize%5D={}&publisher=true",
-        percent_encode(req.query.trim()),
+        percent_encode(eff_q.trim()),
         limit
     );
     let val = crawler.get_json(&url)?;

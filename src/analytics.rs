@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::community_detection::build_full_community_report;
 use crate::models::{
@@ -890,4 +891,264 @@ pub fn find_shortest_epistemic_path(
         }
     }
     None
+}
+
+/// "Publish or Perish"-compatible bibliometric citation impact summary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PopCitationMetrics {
+    pub total_papers: usize,
+    pub total_citations: u64,
+    pub min_year: i32,
+    pub max_year: i32,
+    pub year_span: i32,
+    pub cites_per_year: f64,
+    pub cites_per_paper: f64,
+    pub cites_per_author: f64,
+    pub authors_per_paper: f64,
+    pub h_index: usize,
+    pub g_index: usize,
+    pub hi_norm: usize,
+    pub hi_annual: f64,
+    pub e_index: f64,
+    pub ha_index: usize,
+}
+
+/// Counts distinct authors in a bibliography string such as `"A. Smith, B. Jones"` or `"Smith, A."`.
+pub fn count_paper_authors(authors: &str) -> usize {
+    let trimmed = authors.trim();
+    if trimmed.is_empty() {
+        return 1;
+    }
+    let has_et_al = trimmed.to_ascii_lowercase().contains("et al.");
+    let cleaned = trimmed
+        .replace(", et al.", "")
+        .replace("et al.", "")
+        .replace(" and ", ", ");
+
+    let segments: Vec<&str> = if cleaned.contains(';') {
+        cleaned.split(';').map(str::trim).filter(|s| !s.is_empty()).collect()
+    } else {
+        cleaned.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
+    };
+
+    if segments.is_empty() {
+        return 1;
+    }
+
+    let mut author_count = 0usize;
+    for (idx, seg) in segments.iter().enumerate() {
+        let is_initials_only = idx > 0
+            && !cleaned.contains(';')
+            && seg.split_whitespace().all(|tok| {
+                let letters = tok.trim_end_matches('.');
+                !letters.is_empty() && letters.chars().count() <= 2
+            });
+        if !is_initials_only {
+            author_count += 1;
+        }
+    }
+    (author_count + usize::from(has_et_al)).max(1)
+}
+
+pub fn effective_record_citations(rec: &PaperRecord, in_deg: usize) -> u64 {
+    rec.external_citations.unwrap_or(in_deg as u64).max(in_deg as u64)
+}
+
+pub fn compute_pop_citation_metrics_from_pairs(
+    items: &[(&PaperRecord, u64)],
+    horizon_year: i32,
+) -> PopCitationMetrics {
+    if items.is_empty() {
+        return PopCitationMetrics::default();
+    }
+
+    let total_papers = items.len();
+    let mut cites: Vec<u64> = Vec::with_capacity(total_papers);
+    let mut norm_cites: Vec<f64> = Vec::with_capacity(total_papers);
+    let mut annual_rates: Vec<f64> = Vec::with_capacity(total_papers);
+
+    let mut total_citations: u64 = 0;
+    let mut total_author_norm_cites: f64 = 0.0;
+    let mut total_authors_sum: usize = 0;
+    let mut min_year = i32::MAX;
+    let mut max_year = i32::MIN;
+
+    for &(rec, c) in items {
+        let a = count_paper_authors(&rec.authors);
+        let age = (horizon_year - rec.year + 1).max(1) as f64;
+        let c_norm = (c as f64) / (a as f64);
+        let c_rate = (c as f64) / age;
+
+        min_year = min_year.min(rec.year);
+        max_year = max_year.max(rec.year);
+        total_citations = total_citations.saturating_add(c);
+        total_author_norm_cites += c_norm;
+        total_authors_sum += a;
+
+        cites.push(c);
+        norm_cites.push(c_norm);
+        annual_rates.push(c_rate);
+    }
+
+    let year_span = (horizon_year - min_year + 1).max(1);
+    let cites_per_year = (total_citations as f64) / (year_span as f64);
+    let cites_per_paper = (total_citations as f64) / (total_papers as f64);
+    let cites_per_author = total_author_norm_cites;
+    let authors_per_paper = (total_authors_sum as f64) / (total_papers as f64);
+
+    cites.sort_unstable_by(|a, b| b.cmp(a));
+    let mut h_index = 0usize;
+    let mut h_core_sum: u64 = 0;
+    for (i, &c) in cites.iter().enumerate() {
+        let rank = (i + 1) as u64;
+        if c >= rank {
+            h_index = i + 1;
+            h_core_sum = h_core_sum.saturating_add(c);
+        } else {
+            break;
+        }
+    }
+
+    let excess = h_core_sum.saturating_sub((h_index as u64) * (h_index as u64));
+    let e_index = (excess as f64).sqrt();
+
+    let mut g_index = 0usize;
+    let mut running_sum: u64 = 0;
+    for (i, &c) in cites.iter().enumerate() {
+        running_sum = running_sum.saturating_add(c);
+        let g = (i + 1) as u64;
+        if running_sum >= g * g {
+            g_index = i + 1;
+        }
+    }
+
+    norm_cites.sort_by(|a, b| b.total_cmp(a));
+    let mut hi_norm = 0usize;
+    for (i, &cn) in norm_cites.iter().enumerate() {
+        if cn >= (i + 1) as f64 {
+            hi_norm = i + 1;
+        } else {
+            break;
+        }
+    }
+    let hi_annual = (hi_norm as f64) / (year_span as f64);
+
+    annual_rates.sort_by(|a, b| b.total_cmp(a));
+    let mut ha_index = 0usize;
+    for (i, &rate) in annual_rates.iter().enumerate() {
+        if rate >= (i + 1) as f64 {
+            ha_index = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    PopCitationMetrics {
+        total_papers,
+        total_citations,
+        min_year,
+        max_year,
+        year_span,
+        cites_per_year,
+        cites_per_paper,
+        cites_per_author,
+        authors_per_paper,
+        h_index,
+        g_index,
+        hi_norm,
+        hi_annual,
+        e_index,
+        ha_index,
+    }
+}
+
+pub fn compute_pop_citation_metrics(
+    papers: &[PaperMetrics],
+    horizon_year: i32,
+) -> PopCitationMetrics {
+    let pairs: Vec<(&PaperRecord, u64)> = papers
+        .iter()
+        .map(|pm| (&pm.record, effective_record_citations(&pm.record, pm.in_deg)))
+        .collect();
+    compute_pop_citation_metrics_from_pairs(&pairs, horizon_year)
+}
+
+pub fn compute_pop_citation_metrics_records(
+    records: &[PaperRecord],
+    horizon_year: i32,
+) -> PopCitationMetrics {
+    let pairs: Vec<(&PaperRecord, u64)> = records
+        .iter()
+        .map(|r| (r, r.external_citations.unwrap_or(0)))
+        .collect();
+    compute_pop_citation_metrics_from_pairs(&pairs, horizon_year)
+}
+
+#[cfg(test)]
+mod pop_tests {
+    use super::*;
+    use crate::models::OaStatus;
+
+    fn mk_paper(id: &str, authors: &str, year: i32, cites: u64) -> PaperRecord {
+        PaperRecord {
+            id: id.to_string(),
+            title: id.to_string(),
+            authors: authors.to_string(),
+            year,
+            venue: "Test Journal".to_string(),
+            disc: Discipline::INF,
+            doi: String::new(),
+            arxiv_id: String::new(),
+            openalex_id: String::new(),
+            s2_id: String::new(),
+            pmcid: String::new(),
+            source_url: String::new(),
+            oa_pdf_url: String::new(),
+            oa_status: OaStatus::Gold,
+            external_citations: Some(cites),
+            abstract_text: String::new(),
+            terms: Vec::new(),
+            concepts: Vec::new(),
+            local_pdf_path: None,
+            pdf_sha256: None,
+            pdf_bytes: None,
+            raw_references: Vec::new(),
+            retraction: Default::default(),
+            datacite_links: Vec::new(),
+            bio_entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pop_metrics_compute_exact_h_g_e_hi_and_ha() {
+        let recs = vec![
+            mk_paper("p1", "A. Alpha", 2021, 30),         // norm 30, age 6 -> 5.0/yr
+            mk_paper("p2", "A. Alpha, B. Beta", 2022, 12), // norm 6,  age 5 -> 2.4/yr
+            mk_paper("p3", "A. Alpha, B. Beta, C. Gamma", 2024, 9), // norm 3, age 3 -> 3.0/yr
+            mk_paper("p4", "A. Alpha, B. Beta", 2025, 2),  // norm 1,  age 2 -> 1.0/yr
+        ];
+        // Horizon 2026 => year_span = 2026 - 2021 + 1 = 6
+        let m = compute_pop_citation_metrics_records(&recs, 2026);
+        assert_eq!(m.total_papers, 4);
+        assert_eq!(m.total_citations, 53);
+        assert_eq!(m.h_index, 3); // [30>=1, 12>=2, 9>=3, 2<4]
+        assert_eq!(m.g_index, 4); // sum=53 >= 16
+        // e-index = sqrt((30 + 12 + 9) - 9) = sqrt(42)
+        assert!((m.e_index - 42.0f64.sqrt()).abs() < 1e-6);
+        // norm_cites desc = [30, 6, 3, 1] -> hi_norm = 3 (3 >= 3, 1 < 4)
+        assert_eq!(m.hi_norm, 3);
+        assert!((m.hi_annual - 0.5).abs() < 1e-6);
+        // annual_rates desc = [5.0, 3.0, 2.4, 1.0] -> ha_index = 2 (5.0>=1, 3.0>=2, 2.4<3)
+        assert_eq!(m.ha_index, 2);
+        assert!((m.cites_per_author - 40.0).abs() < 1e-6);
+        assert!((m.authors_per_paper - 2.0).abs() < 1e-6);
+        assert!((m.cites_per_paper - 13.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn author_counter_handles_last_comma_initials() {
+        assert_eq!(count_paper_authors("Shannon, C. E."), 1);
+        assert_eq!(count_paper_authors("C. E. Shannon, W. Weaver"), 2);
+        assert_eq!(count_paper_authors("A. Vaswani, N. Shazeer, N. Parmar et al."), 4);
+    }
 }

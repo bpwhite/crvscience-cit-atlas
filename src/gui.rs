@@ -22,7 +22,10 @@ use std::thread;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use eframe::egui_wgpu;
 
-use crate::analytics::{compute_corpus_analytics, find_shortest_epistemic_path};
+use crate::analytics::{
+    compute_corpus_analytics, compute_pop_citation_metrics, effective_record_citations,
+    find_shortest_epistemic_path,
+};
 use crate::community_detection::{community_rgb, PartitionScheme};
 use crate::corpus::{build_empirical_corpus, generate_synthetic_corpus};
 use crate::downloader::{batch_download_corpus_pdfs, download_single_paper_pdf};
@@ -40,11 +43,12 @@ use crate::graph_viewer::{
 use crate::integrity_bridges::run_full_corpus_screening;
 use crate::models::{
     AnalyticsParams, BioEntityKind, CitationEdge, CorpusAnalytics, Discipline, DownloadItemReport, PaperRecord,
-    RetractionStatus, ScreeningSummary, SearchHarvestSummary, SearchRequest, SyntheticRegime,
-    CONCEPTS,
+    RetractionStatus, ScreeningSummary, SearchHarvestSummary, SearchProvidersConfig, SearchRequest,
+    SyntheticRegime, CONCEPTS,
 };
 use crate::search_providers::{
-    execute_multi_provider_search, lookup_single_doi, merge_and_link_records, ScholarlyHttpClient,
+    execute_multi_provider_search, lookup_single_doi, merge_and_link_records,
+    search_offline_scholarly_only, ScholarlyHttpClient,
 };
 use crate::rate_limiter::{
     global_limiter_mutex, snapshot_global_audit_log, snapshot_global_policies, CrawlAuditOutcome,
@@ -120,6 +124,18 @@ pub enum AuditOutcomeFilter {
     Errors,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopSortColumn {
+    Cites,
+    CitesPerYear,
+    Authors,
+    Title,
+    Year,
+    Venue,
+    SourceDb,
+    Doi,
+}
+
 pub struct CitAtlasApp {
     pub raw_papers: Vec<PaperRecord>,
     pub raw_edges: Vec<CitationEdge>,
@@ -161,6 +177,10 @@ pub struct CitAtlasApp {
     pub search_req: SearchRequest,
     pub merge_search_results: bool,
     pub single_doi_input: String,
+    pub pop_year_min_input: String,
+    pub pop_year_max_input: String,
+    pub pop_sort_col: PopSortColumn,
+    pub pop_sort_asc: bool,
     pub download_dir: String,
     pub download_pace_ms: u64,
     pub is_busy: bool,
@@ -237,11 +257,11 @@ impl CitAtlasApp {
             corpus_label: "Empirical Landmark Corpus (47 Verified Works, 1948-2026)".to_string(),
             params,
             analytics,
-            domain: ActiveDomain::Observatory,
+            domain: ActiveDomain::SearchAndDownload,
             disc_filter: None,
             filter_text: String::new(),
             focused_paper_id: "shannon1948".to_string(),
-            show_dossier_panel: true,
+            show_dossier_panel: false,
             status_banner: "Ready — 47 verified landmark papers and 78 citation edges loaded.".to_string(),
             compared_ids: vec![
                 "shannon1948".to_string(),
@@ -268,6 +288,10 @@ impl CitAtlasApp {
             search_req: SearchRequest::default(),
             merge_search_results: false,
             single_doi_input: "10.1073/pnas.1424329112".to_string(),
+            pop_year_min_input: String::new(),
+            pop_year_max_input: String::new(),
+            pop_sort_col: PopSortColumn::Cites,
+            pop_sort_asc: false,
             download_dir: "./cit_atlas_downloads".to_string(),
             download_pace_ms: 450,
             is_busy: false,
@@ -362,15 +386,27 @@ impl CitAtlasApp {
     }
 
     fn sync_gpu_mirror_into_viewer(&mut self) {
+        let active_drag_id = self.graph_viewer.dragged_node_id.clone();
         if let Ok(mir) = self.gpu_mirror.lock() {
             if mir.coords.len() >= self.analytics.papers.len() && !self.analytics.papers.is_empty() {
                 for (i, p) in self.analytics.papers.iter().enumerate() {
+                    if active_drag_id.as_deref() == Some(p.record.id.as_str()) {
+                        continue;
+                    }
                     self.graph_viewer.positions.insert(p.record.id.clone(), mir.coords[i]);
                 }
                 for (k, art) in self.graph_viewer.artifact_nodes.iter_mut().enumerate() {
                     let g_idx = self.analytics.papers.len() + k;
                     if let Some(&xy) = mir.coords.get(g_idx) {
                         art.pos = xy;
+                    }
+                }
+                if !self.graph_viewer.bio_entity_nodes.is_empty() {
+                    let bio_base = self.analytics.papers.len() + self.graph_viewer.artifact_nodes.len();
+                    for (k, bn) in self.graph_viewer.bio_entity_nodes.iter_mut().enumerate() {
+                        if let Some(&xy) = mir.coords.get(bio_base + k) {
+                            bn.pos = xy;
+                        }
                     }
                 }
             }
@@ -729,12 +765,15 @@ impl CitAtlasApp {
             })
     }
 
-    fn start_background_search(&mut self) {
+    fn start_background_search_with_mode(&mut self, merge_into_existing: bool) {
         if self.is_busy {
             return;
         }
+        self.search_req.year_min = self.pop_year_min_input.trim().parse::<i32>().ok();
+        self.search_req.year_max = self.pop_year_max_input.trim().parse::<i32>().ok();
+        let active_label = crate::search_providers::build_effective_query(&self.search_req);
         self.is_busy = true;
-        self.busy_label = format!("Harvesting scholarly APIs & crawlers for '{}'...", self.search_req.query);
+        self.busy_label = format!("Harvesting scholarly APIs & crawlers for '{}'...", active_label);
         let mut req_clone = self.search_req.clone();
         req_clone.crawl.local_html_paths = self
             .local_scholar_html_input
@@ -743,12 +782,11 @@ impl CitAtlasApp {
             .filter(|s| !s.is_empty())
             .collect();
         req_clone.crawl.retraction_watch_csv_path = self.rw_csv_path_input.trim().to_string();
-        let merge_flag = self.merge_search_results;
         let tx = self.worker_tx.clone();
         thread::spawn(move || {
             let result = execute_multi_provider_search(&req_clone);
             let _ = tx.send(WorkerEvent::SearchCompleted {
-                merge_into_existing: merge_flag,
+                merge_into_existing,
                 result,
             });
         });
@@ -922,9 +960,7 @@ impl CitAtlasApp {
     pub fn configure_screenshot_view(&mut self, view: u8) {
         match view {
             2 => {
-                self.domain = ActiveDomain::CommunitiesLouvainInfomap;
-                self.focused_paper_id = "rosvall2008".to_string();
-                self.show_dossier_panel = true;
+                self.configure_screenshot_state();
             }
             3 => {
                 self.domain = ActiveDomain::VelocityAndAwakening;
@@ -933,7 +969,44 @@ impl CitAtlasApp {
                 self.focused_paper_id = "ke2015".to_string();
                 self.show_dossier_panel = true;
             }
-            _ => self.configure_screenshot_state(),
+            _ => {
+                self.domain = ActiveDomain::SearchAndDownload;
+                self.show_dossier_panel = false;
+                self.search_req.query = String::new();
+                self.search_req.keywords_all = "Publish or Perish citation network transformer AlphaFold".to_string();
+                self.search_req.authors = String::new();
+                self.search_req.publication_venue = String::new();
+                self.pop_year_min_input = "2000".to_string();
+                self.pop_year_max_input = "2026".to_string();
+                self.search_req.year_min = Some(2000);
+                self.search_req.year_max = Some(2026);
+                let mut offline_req = SearchRequest::default();
+                offline_req.query = String::new();
+                offline_req.year_min = Some(1948);
+                offline_req.max_per_provider = 25;
+                let harvested = search_offline_scholarly_only(&offline_req);
+                if !harvested.papers.is_empty() {
+                    let existing_edges = self.raw_edges.clone();
+                    let (merged_p, mut merged_e) =
+                        merge_and_link_records(harvested.papers, false, None, None);
+                    for old_e in existing_edges {
+                        if !merged_e
+                            .iter()
+                            .any(|e| e.source == old_e.source && e.target == old_e.target)
+                        {
+                            merged_e.push(old_e);
+                        }
+                    }
+                    self.raw_papers = merged_p;
+                    self.raw_edges = merged_e;
+                    self.corpus_label = format!(
+                        "Scholarly Literature Index ({} Papers, {} Citation Edges)",
+                        self.raw_papers.len(),
+                        self.raw_edges.len()
+                    );
+                    self.recompute_all();
+                }
+            }
         }
     }
 
@@ -954,30 +1027,21 @@ impl CitAtlasApp {
                 ui.separator();
 
                 let tabs = [
-                    (ActiveDomain::Observatory, "1. Observatory"),
-                    (ActiveDomain::NetworkGraphViewer, "2. Network Viewer"),
-                    (ActiveDomain::SearchAndDownload, "3. Search & Crawl"),
+                    (ActiveDomain::SearchAndDownload, "1. Literature Search (Publish or Perish)"),
+                    (ActiveDomain::NetworkGraphViewer, "2. Citation Graph Viewer"),
+                    (ActiveDomain::Observatory, "3. Observatory"),
                     (ActiveDomain::VelocityAndAwakening, "4. Velocity"),
                     (ActiveDomain::BridgeCartography, "5. Bridges"),
                     (ActiveDomain::CommunitiesLouvainInfomap, "6. Louvain & Infomap"),
-                    (ActiveDomain::TopicDriftMiJsd, "7. MI & JSD Drift"),
-                    (ActiveDomain::LedgerAndLab, "8. SQLite, CSV & Graph"),
-                    (ActiveDomain::RateLimiterAndAudit, "9. Rate Limiter & Audit"),
+                    (ActiveDomain::TopicDriftMiJsd, "7. MI & JSD"),
+                    (ActiveDomain::LedgerAndLab, "8. SQLite & CSV"),
+                    (ActiveDomain::RateLimiterAndAudit, "9. Rate Audit"),
                 ];
                 for (dom, label) in tabs {
                     if ui.selectable_label(self.domain == dom, label).clicked() {
                         self.domain = dom;
                     }
                 }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .selectable_label(self.show_dossier_panel, "Paper Dossier")
-                        .clicked()
-                    {
-                        self.show_dossier_panel = !self.show_dossier_panel;
-                    }
-                });
             });
 
             ui.separator();
@@ -1023,7 +1087,7 @@ impl CitAtlasApp {
                 ui.label("Filter:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter_text)
-                        .desired_width(145.0)
+                        .desired_width(130.0)
                         .hint_text("Author, title, DOI..."),
                 );
                 if ui
@@ -1043,6 +1107,22 @@ impl CitAtlasApp {
                     {
                         self.disc_filter = Some(d);
                     }
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(
+                        self.domain == ActiveDomain::SearchAndDownload,
+                        RichText::new("Search Databases").strong().color(Color32::from_rgb(56, 189, 248)),
+                    )
+                    .clicked()
+                {
+                    self.domain = ActiveDomain::SearchAndDownload;
+                }
+                if ui
+                    .selectable_label(self.show_dossier_panel, "Paper Dossier")
+                    .clicked()
+                {
+                    self.show_dossier_panel = !self.show_dossier_panel;
                 }
             });
             if changed {
@@ -2033,6 +2113,10 @@ impl CitAtlasApp {
             return;
         }
 
+        if self.graph_viewer.dragged_node_id.is_none() {
+            self.sync_gpu_mirror_into_viewer();
+        }
+
         // Cursor-centered smooth scroll-wheel zoom (0.18x to 12.0x for 50k+ node exploration)
         let pointer_pos = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.hover_pos()));
         if resp.hovered() {
@@ -2123,9 +2207,7 @@ impl CitAtlasApp {
         if resp.drag_started() {
             if let Some(h_idx) = hovered_idx {
                 let nid = self.analytics.papers[h_idx].record.id.clone();
-                self.focused_paper_id = nid.clone();
                 self.graph_viewer.dragged_node_id = Some(nid);
-                self.bump_gpu_revision();
             } else {
                 self.graph_viewer.dragged_node_id = None;
             }
@@ -2140,7 +2222,15 @@ impl CitAtlasApp {
                     self.graph_viewer.positions.insert(drag_id.clone(), drag_world);
                     if let Some(pos_idx) = self.analytics.papers.iter().position(|p| &p.record.id == drag_id) {
                         dragged_idx_i32 = pos_idx as i32;
+                        if let Ok(mut mir) = self.gpu_mirror.lock() {
+                            if pos_idx < mir.coords.len() {
+                                mir.coords[pos_idx] = drag_world;
+                                let coords_clone = mir.coords.clone();
+                                mir.pick_grid.rebuild(&coords_clone);
+                            }
+                        }
                     }
+                    self.rebuild_cpu_pick_grid();
                 }
             } else {
                 let delta = resp.drag_delta();
@@ -2151,6 +2241,8 @@ impl CitAtlasApp {
 
         if resp.drag_stopped() {
             self.graph_viewer.dragged_node_id = None;
+            self.sync_gpu_mirror_into_viewer();
+            self.rebuild_cpu_pick_grid();
         }
 
         if resp.clicked() {
@@ -3017,285 +3109,692 @@ impl CitAtlasApp {
         }
     }
 
-    fn ui_search_and_download(&mut self, ui: &mut egui::Ui) {
-        ui.columns(2, |cols| {
-            // Left: 13-Source API Search & Polite Web Crawler Studio
-            cols[0].group(|ui| {
-                ui.heading("Scholarly APIs & Polite Web Crawler (13 Repositories & Citation Graphs)");
-                ui.weak("Harvests OpenAlex, Semantic Scholar, Crossref, arXiv, OpenAIRE Graph + ScholExplorer, INSPIRE-HEP, NASA ADS, DataCite, Google Scholar, PubMed, Europe PMC, DBLP, and bioRxiv/medRxiv.");
-                ui.add_space(6.0);
+    fn infer_paper_source_db(p: &PaperRecord) -> &'static str {
+        if !p.openalex_id.is_empty() {
+            "OpenAlex"
+        } else if !p.s2_id.is_empty() {
+            "Semantic Scholar"
+        } else if !p.arxiv_id.is_empty() {
+            "arXiv"
+        } else if !p.pmcid.is_empty() || p.terms.iter().any(|t| t.starts_with("pmid:")) {
+            "PubMed / EPMC"
+        } else if !p.doi.is_empty() {
+            "Crossref / DOI"
+        } else {
+            "Local Index"
+        }
+    }
 
-                ui.label("Search / Crawl Query:");
-                ui.add(egui::TextEdit::singleline(&mut self.search_req.query).desired_width(f32::INFINITY));
+    fn toggle_pop_sort(&mut self, col: PopSortColumn) {
+        if self.pop_sort_col == col {
+            self.pop_sort_asc = !self.pop_sort_asc;
+        } else {
+            self.pop_sort_col = col;
+            self.pop_sort_asc = matches!(
+                col,
+                PopSortColumn::Authors | PopSortColumn::Title | PopSortColumn::Venue | PopSortColumn::SourceDb | PopSortColumn::Doi
+            );
+        }
+    }
 
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("APIs:");
-                    ui.checkbox(&mut self.search_req.providers.openalex, "OpenAlex");
-                    ui.checkbox(&mut self.search_req.providers.semantic_scholar, "Semantic Scholar");
-                    ui.checkbox(&mut self.search_req.providers.crossref, "Crossref");
-                    ui.checkbox(&mut self.search_req.providers.arxiv, "arXiv");
-                    ui.checkbox(&mut self.search_req.providers.openaire, "OpenAIRE Graph");
-                    ui.checkbox(&mut self.search_req.providers.inspire_hep, "INSPIRE-HEP");
-                    ui.checkbox(&mut self.search_req.providers.nasa_ads, "NASA ADS");
-                    ui.checkbox(&mut self.search_req.providers.datacite, "DataCite");
-                });
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("Crawlers:");
-                    ui.checkbox(&mut self.search_req.providers.google_scholar, "Google Scholar");
-                    ui.checkbox(&mut self.search_req.providers.pubmed, "PubMed");
-                    ui.checkbox(&mut self.search_req.providers.europe_pmc, "Europe PMC");
-                    ui.checkbox(&mut self.search_req.providers.dblp, "DBLP");
-                    ui.checkbox(&mut self.search_req.providers.biorxiv_medrxiv, "bioRxiv/medRxiv");
-                });
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Max / Source:");
-                    ui.add(egui::Slider::new(&mut self.search_req.max_per_provider, 5..=60));
-                    ui.checkbox(&mut self.search_req.oa_only, "OA Only");
-                    let mut snowball = self.search_req.snowball_hops > 0;
-                    if ui.checkbox(&mut snowball, "1-Hop Snowball").changed() {
-                        self.search_req.snowball_hops = if snowball { 1 } else { 0 };
-                    }
-                });
-
-                ui.collapsing("Polite Crawler & API Tokens (OpenAIRE, NASA ADS, Scholar SERP & Hydration)", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("OpenAIRE Token:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search_req.crawl.openaire_token)
-                                .password(true)
-                                .desired_width(145.0)
-                                .hint_text("Optional (or OPENAIRE_API_TOKEN)"),
-                        );
-                        ui.label("NASA ADS Token:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search_req.crawl.nasa_ads_token)
-                                .password(true)
-                                .desired_width(145.0)
-                                .hint_text("Bearer (or ADS_API_TOKEN)"),
-                        );
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("SERP Pages:");
-                        ui.add(egui::Slider::new(&mut self.search_req.crawl.max_pages, 1..=8));
-                        ui.label("Crawl Pace (ms):");
-                        ui.add(egui::Slider::new(&mut self.search_req.crawl.pace_ms, 500..=8000));
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut self.search_req.crawl.respect_robots_txt, "Respect robots.txt");
-                        ui.checkbox(&mut self.search_req.crawl.hydrate_citation_edges, "Hydrate OpenCitations + iCite");
-                        ui.checkbox(&mut self.search_req.crawl.filter_self_citations, "Drop Self-Citations");
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut self.search_req.crawl.screen_retractions, "Crossref Retraction Watch");
-                        ui.checkbox(&mut self.search_req.crawl.track_datacite_bridges, "DataCite Dataset/Software Bridges");
-                        ui.checkbox(&mut self.search_req.crawl.track_epmc_annotations, "Europe PMC Annotations (GO/EFO/ChEBI)");
-                        ui.checkbox(&mut self.search_req.crawl.track_uniprot_pdb_bridges, "UniProtKB + RCSB PDB Bridges");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Local RW CSV:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.rw_csv_path_input)
-                                .desired_width(240.0)
-                                .hint_text("Optional retraction_watch.csv"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Scholar cites= ID:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search_req.crawl.scholar_cites_cluster_id)
-                                .desired_width(145.0)
-                                .hint_text("Optional cluster ID"),
-                        );
-                        ui.label("Proxy:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search_req.crawl.proxy_url)
-                                .desired_width(150.0)
-                                .hint_text("http://127.0.0.1:8080"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Saved Scholar .html:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.local_scholar_html_input)
-                                .desired_width(240.0)
-                                .hint_text("path/to/scholar_page1.html"),
-                        );
-                    });
-                });
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Polite Pool Email:");
-                    ui.add(egui::TextEdit::singleline(&mut self.search_req.polite_email).desired_width(200.0));
-                    ui.checkbox(&mut self.merge_search_results, "Merge Into Current Graph");
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            !self.is_busy,
-                            egui::Button::new(RichText::new("Run Search / Crawl & Build Graph").strong()),
-                        )
-                        .clicked()
-                    {
-                        self.start_background_search();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.is_busy && !self.raw_papers.is_empty(),
-                            egui::Button::new("Screen Corpus (Retractions + DataCite + Europe PMC + UniProt/PDB)"),
-                        )
-                        .clicked()
-                    {
-                        self.start_background_screening();
-                    }
-                    if ui.button("Export Raw Catalog CSV").clicked() {
-                        let out_dir = PathBuf::from(self.download_dir.trim());
-                        let _ = std::fs::create_dir_all(&out_dir);
-                        let csv_p = out_dir.join("raw_harvest_catalog.csv");
-                        match export_raw_papers_csv(&self.raw_papers, &csv_p) {
-                            Ok(_) => self.status_banner = format!("Saved raw catalog CSV to {:?}", csv_p),
-                            Err(e) => self.status_banner = e,
-                        }
-                    }
-                });
-
-                ui.separator();
-                ui.label(RichText::new("Single DOI Direct Resolver").strong());
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.single_doi_input)
-                            .desired_width(240.0)
-                            .hint_text("10.1073/pnas.1424329112"),
-                    );
-                    if ui
-                        .add_enabled(!self.is_busy, egui::Button::new("Resolve & Add DOI"))
-                        .clicked()
-                    {
-                        let doi = self.single_doi_input.clone();
-                        let email = self.search_req.polite_email.clone();
-                        let tx = self.worker_tx.clone();
-                        self.is_busy = true;
-                        self.busy_label = format!("Resolving DOI {}...", doi);
-                        thread::spawn(move || {
-                            let res = lookup_single_doi(&doi, &email);
-                            let _ = tx.send(WorkerEvent::DoiLookupCompleted(res));
-                        });
-                    }
-                });
-            });
-
-            // Right: Verified Legal Open-Access PDF Batch Downloader
-            cols[1].group(|ui| {
-                ui.heading("Verified Open-Access PDF Batch Downloader");
-                ui.weak("4-Stage Resolution: Provider OA URL -> Unpaywall v2 DOI -> arXiv Direct PDF -> Europe PMC. Verifies %PDF- binary magic header, computes SHA-256, and writes BibTeX + audit manifest.");
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Output Folder:");
-                    ui.add(egui::TextEdit::singleline(&mut self.download_dir).desired_width(240.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Polite Request Pacing (ms):");
-                    ui.add(egui::Slider::new(&mut self.download_pace_ms, 100..=2000));
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            !self.is_busy && !self.raw_papers.is_empty(),
-                            egui::Button::new(
-                                RichText::new(format!(
-                                    "Batch Download OA PDFs ({} Corpus Papers)",
-                                    self.raw_papers.len()
-                                ))
-                                .strong(),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.start_background_batch_download();
-                    }
-
-                    if ui.button("Export BibTeX (.bib)").clicked() {
-                        let out_dir = PathBuf::from(self.download_dir.trim());
-                        let _ = std::fs::create_dir_all(&out_dir);
-                        let bib_path = out_dir.join("corpus_references.bib");
-                        let bib = format_bibtex_corpus(&self.raw_papers);
-                        match std::fs::write(&bib_path, bib) {
-                            Ok(_) => {
-                                self.status_banner =
-                                    format!("Saved BibTeX library to {:?}", bib_path);
-                            }
-                            Err(e) => {
-                                self.status_banner = format!("BibTeX write failed: {}", e);
-                            }
-                        }
-                    }
-                });
-
-                if let Some((done, total)) = self.download_progress {
-                    let frac = (done as f32) / (total.max(1) as f32);
-                    ui.add_space(6.0);
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .text(format!("Verified {}/{} papers", done, total)),
-                    );
+    fn apply_offline_instant_search(&mut self, merge_into_existing: bool) {
+        self.search_req.year_min = self.pop_year_min_input.trim().parse::<i32>().ok();
+        self.search_req.year_max = self.pop_year_max_input.trim().parse::<i32>().ok();
+        let summary = search_offline_scholarly_only(&self.search_req);
+        if summary.papers.is_empty() {
+            self.status_banner = "Local scholarly index returned 0 matches for current PoP criteria.".to_string();
+            return;
+        }
+        if merge_into_existing {
+            let mut combined = self.raw_papers.clone();
+            combined.extend(summary.papers);
+            let (merged_p, mut merged_e) = merge_and_link_records(combined, false, None, None);
+            for old_e in &self.raw_edges {
+                if !merged_e.iter().any(|e| e.source == old_e.source && e.target == old_e.target) {
+                    merged_e.push(old_e.clone());
                 }
-            });
+            }
+            for new_e in summary.edges {
+                if !merged_e.iter().any(|e| e.source == new_e.source && e.target == new_e.target) {
+                    merged_e.push(new_e);
+                }
+            }
+            self.raw_papers = merged_p;
+            self.raw_edges = merged_e;
+        } else {
+            self.raw_papers = summary.papers;
+            self.raw_edges = summary.edges;
+        }
+        self.corpus_label = format!(
+            "Local Scholarly Search ({} Papers, {} Edges)",
+            self.raw_papers.len(),
+            self.raw_edges.len()
+        );
+        self.recompute_all();
+        self.status_banner = format!(
+            "Offline index matched {} works and {} citation edges.",
+            self.raw_papers.len(),
+            self.raw_edges.len()
+        );
+    }
+
+    fn ui_search_and_download(&mut self, ui: &mut egui::Ui) {
+        let avail_w = ui.available_width().max(900.0);
+        let col1_w = (avail_w * 0.255).clamp(240.0, 390.0);
+        let col3_w = (avail_w * 0.265).clamp(250.0, 410.0);
+        let col2_w = (avail_w - col1_w - col3_w - 28.0).max(340.0);
+
+        // Top 3-Column Publish-or-Perish Workbench: Databases | Query Builder | Metrics Summary
+        ui.horizontal_top(|ui| {
+            // ----------------------------------------------------------------
+            // TOP-LEFT: Database Checkboxes, Domain Presets & Collapsed Controls
+            // ----------------------------------------------------------------
+            ui.allocate_ui_with_layout(
+                Vec2::new(col1_w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.group(|ui| {
+                        ui.set_min_width(col1_w - 8.0);
+                        ui.label(
+                            RichText::new("Databases & Presets")
+                                .strong()
+                                .color(Color32::from_rgb(56, 189, 248)),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.small_button("All Open APIs").clicked() {
+                                self.search_req.providers = SearchProvidersConfig::all_open_apis();
+                            }
+                            if ui.small_button("Biomed").clicked() {
+                                self.search_req.providers = SearchProvidersConfig::biomed_preset();
+                            }
+                            if ui.small_button("CS/AI").clicked() {
+                                self.search_req.providers = SearchProvidersConfig::cs_ai_preset();
+                            }
+                            if ui.small_button("Physics/Astro").clicked() {
+                                self.search_req.providers = SearchProvidersConfig::physics_astro_preset();
+                            }
+                        });
+
+                        ui.add_space(3.0);
+                        ui.columns(2, |c| {
+                            c[0].checkbox(&mut self.search_req.providers.openalex, "OpenAlex");
+                            c[0].checkbox(&mut self.search_req.providers.crossref, "Crossref");
+                            c[0].checkbox(&mut self.search_req.providers.semantic_scholar, "Semantic Scholar");
+                            c[0].checkbox(&mut self.search_req.providers.arxiv, "arXiv");
+                            c[0].checkbox(&mut self.search_req.providers.openaire, "OpenAIRE Graph");
+                            c[0].checkbox(&mut self.search_req.providers.inspire_hep, "INSPIRE-HEP");
+                            c[0].checkbox(&mut self.search_req.providers.nasa_ads, "NASA ADS");
+
+                            c[1].checkbox(&mut self.search_req.providers.pubmed, "PubMed");
+                            c[1].checkbox(&mut self.search_req.providers.europe_pmc, "Europe PMC");
+                            c[1].checkbox(&mut self.search_req.providers.biorxiv_medrxiv, "bioRxiv / medRxiv");
+                            c[1].checkbox(&mut self.search_req.providers.dblp, "DBLP (CS)");
+                            c[1].checkbox(&mut self.search_req.providers.datacite, "DataCite");
+                            c[1].checkbox(&mut self.search_req.providers.google_scholar, "Google Scholar");
+                        });
+
+                        ui.add_space(2.0);
+                        ui.collapsing("Advanced Rate-Limit, Proxy & Tokens", |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Max/Src:");
+                                ui.add(egui::Slider::new(&mut self.search_req.max_per_provider, 5..=60));
+                                let mut snowball = self.search_req.snowball_hops > 0;
+                                if ui.checkbox(&mut snowball, "1-Hop Snowball").changed() {
+                                    self.search_req.snowball_hops = if snowball { 1 } else { 0 };
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("OpenAIRE:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.crawl.openaire_token)
+                                        .password(true)
+                                        .desired_width(105.0)
+                                        .hint_text("Token"),
+                                );
+                                ui.label("ADS:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.crawl.nasa_ads_token)
+                                        .password(true)
+                                        .desired_width(105.0)
+                                        .hint_text("Token"),
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Pages:");
+                                ui.add(egui::Slider::new(&mut self.search_req.crawl.max_pages, 1..=8));
+                                ui.label("Pace(ms):");
+                                ui.add(egui::Slider::new(&mut self.search_req.crawl.pace_ms, 500..=8000));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut self.search_req.crawl.respect_robots_txt, "robots.txt");
+                                ui.checkbox(&mut self.search_req.crawl.hydrate_citation_edges, "OpenCitations+iCite");
+                                ui.checkbox(&mut self.search_req.crawl.filter_self_citations, "Drop Self-Cites");
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut self.search_req.crawl.screen_retractions, "Retraction Watch");
+                                ui.checkbox(&mut self.search_req.crawl.track_datacite_bridges, "DataCite");
+                                ui.checkbox(&mut self.search_req.crawl.track_epmc_annotations, "EPMC Terms");
+                                ui.checkbox(&mut self.search_req.crawl.track_uniprot_pdb_bridges, "UniProt/PDB");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Proxy:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.crawl.proxy_url)
+                                        .desired_width(160.0)
+                                        .hint_text("http://127.0.0.1:8080"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("RW CSV:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.rw_csv_path_input)
+                                        .desired_width(150.0)
+                                        .hint_text("retraction_watch.csv"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Scholar cites=:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.crawl.scholar_cites_cluster_id)
+                                        .desired_width(130.0)
+                                        .hint_text("Cluster ID"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Saved .html:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.local_scholar_html_input)
+                                        .desired_width(145.0)
+                                        .hint_text("scholar_page1.html"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Polite Email:");
+                                ui.add(egui::TextEdit::singleline(&mut self.search_req.polite_email).desired_width(150.0));
+                            });
+                        });
+                    });
+                },
+            );
+
+            // ----------------------------------------------------------------
+            // TOP-CENTER: Publish-or-Perish Fielded Search Form & Actions
+            // ----------------------------------------------------------------
+            ui.allocate_ui_with_layout(
+                Vec2::new(col2_w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.group(|ui| {
+                        ui.set_min_width(col2_w - 8.0);
+                        ui.label(
+                            RichText::new("Literature Search Query Builder (Publish or Perish)")
+                                .strong()
+                                .color(Color32::from_rgb(56, 189, 248)),
+                        );
+                        let field_w = (col2_w - 175.0).max(180.0);
+                        egui::Grid::new("pop_query_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("Authors:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.authors)
+                                        .desired_width(field_w)
+                                        .hint_text("e.g. Shannon, Harzing, Vaswani"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Publication / Venue:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.publication_venue)
+                                        .desired_width(field_w)
+                                        .hint_text("e.g. Nature, Scientometrics, NeurIPS, PNAS"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Title words:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.title_words)
+                                        .desired_width(field_w)
+                                        .hint_text("Words required in paper title"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Keywords (All):");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.keywords_all)
+                                        .desired_width(field_w)
+                                        .hint_text("Keywords in title, abstract or concepts"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Free-text Query:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.query)
+                                        .desired_width(field_w)
+                                        .hint_text("General bibliometric query"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Exclude words:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.exclude_words)
+                                        .desired_width(field_w)
+                                        .hint_text("Terms to exclude (e.g. survey retracted)"),
+                                );
+                                ui.end_row();
+
+                                ui.label("DOI / PMID / arXiv / ORCID:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_req.identifier_lookup)
+                                        .desired_width(field_w)
+                                        .hint_text("10.1073/pnas.0507655102 or arXiv:1706.03762 or PMID or ORCID"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Years & Scope:");
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.pop_year_min_input)
+                                            .desired_width(58.0)
+                                            .hint_text("From"),
+                                    );
+                                    ui.label("to");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.pop_year_max_input)
+                                            .desired_width(58.0)
+                                            .hint_text("To"),
+                                    );
+                                    ui.checkbox(&mut self.search_req.oa_only, "OA Only");
+                                    if ui.small_button("Clear").clicked() {
+                                        self.search_req.authors.clear();
+                                        self.search_req.publication_venue.clear();
+                                        self.search_req.title_words.clear();
+                                        self.search_req.keywords_all.clear();
+                                        self.search_req.query.clear();
+                                        self.search_req.exclude_words.clear();
+                                        self.search_req.identifier_lookup.clear();
+                                        self.pop_year_min_input.clear();
+                                        self.pop_year_max_input.clear();
+                                        self.search_req.year_min = None;
+                                        self.search_req.year_max = None;
+                                    }
+                                });
+                                ui.end_row();
+                            });
+
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let primary_btn = egui::Button::new(
+                                RichText::new("Search Databases").strong().color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(14, 116, 144));
+                            if ui.add_enabled(!self.is_busy, primary_btn).clicked() {
+                                self.start_background_search_with_mode(self.merge_search_results);
+                            }
+                            if ui
+                                .add_enabled(!self.is_busy, egui::Button::new("+ Append"))
+                                .clicked()
+                            {
+                                self.merge_search_results = true;
+                                self.start_background_search_with_mode(true);
+                            }
+                            if ui
+                                .add_enabled(!self.is_busy, egui::Button::new("Replace"))
+                                .clicked()
+                            {
+                                self.merge_search_results = false;
+                                self.start_background_search_with_mode(false);
+                            }
+                            if ui
+                                .add_enabled(!self.is_busy, egui::Button::new("Instant Local"))
+                                .clicked()
+                            {
+                                self.apply_offline_instant_search(self.merge_search_results);
+                            }
+                            if ui.button("Export CSV / BibTeX").clicked() {
+                                let out_dir = PathBuf::from(self.download_dir.trim());
+                                let _ = std::fs::create_dir_all(&out_dir);
+                                let csv_p = out_dir.join("raw_harvest_catalog.csv");
+                                let bib_p = out_dir.join("corpus_references.bib");
+                                let csv_res = export_raw_papers_csv(&self.raw_papers, &csv_p);
+                                let bib_res = std::fs::write(&bib_p, format_bibtex_corpus(&self.raw_papers));
+                                match (csv_res, bib_res) {
+                                    (Ok(_), Ok(_)) => {
+                                        self.status_banner = format!(
+                                            "Exported {} works to {:?} and {:?}",
+                                            self.raw_papers.len(),
+                                            csv_p,
+                                            bib_p
+                                        );
+                                    }
+                                    (Err(e), _) => self.status_banner = e,
+                                    (_, Err(e)) => self.status_banner = format!("BibTeX export failed: {}", e),
+                                }
+                            }
+                        });
+
+                        ui.add_space(2.0);
+                        ui.collapsing("Direct DOI Resolver, Corpus Screening & OA PDF Batch Downloader", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("DOI:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.single_doi_input)
+                                        .desired_width(200.0)
+                                        .hint_text("10.1073/pnas.1424329112"),
+                                );
+                                if ui
+                                    .add_enabled(!self.is_busy, egui::Button::new("Resolve & Add DOI"))
+                                    .clicked()
+                                {
+                                    let doi = self.single_doi_input.clone();
+                                    let email = self.search_req.polite_email.clone();
+                                    let tx = self.worker_tx.clone();
+                                    self.is_busy = true;
+                                    self.busy_label = format!("Resolving DOI {}...", doi);
+                                    thread::spawn(move || {
+                                        let res = lookup_single_doi(&doi, &email);
+                                        let _ = tx.send(WorkerEvent::DoiLookupCompleted(res));
+                                    });
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.is_busy && !self.raw_papers.is_empty(),
+                                        egui::Button::new("Screen Integrity & Bio-Bridges"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_background_screening();
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("PDF Dir:");
+                                ui.add(egui::TextEdit::singleline(&mut self.download_dir).desired_width(160.0));
+                                if ui
+                                    .add_enabled(
+                                        !self.is_busy && !self.raw_papers.is_empty(),
+                                        egui::Button::new(format!(
+                                            "Download OA PDFs ({})",
+                                            self.raw_papers.len()
+                                        )),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_background_batch_download();
+                                }
+                            });
+                            if let Some((done, total)) = self.download_progress {
+                                let frac = (done as f32) / (total.max(1) as f32);
+                                ui.add(egui::ProgressBar::new(frac).text(format!("{}/{}", done, total)));
+                            }
+                        });
+                    });
+                },
+            );
+
+            // ----------------------------------------------------------------
+            // TOP-RIGHT: Live Publish-or-Perish Citation Metrics Summary Panel
+            // ----------------------------------------------------------------
+            ui.allocate_ui_with_layout(
+                Vec2::new(col3_w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let visible_papers: Vec<_> = self
+                        .analytics
+                        .papers
+                        .iter()
+                        .filter(|p| self.matches_paper_filter(p))
+                        .cloned()
+                        .collect();
+                    let pop = compute_pop_citation_metrics(&visible_papers, self.params.horizon_year);
+                    let oa_pct = if visible_papers.is_empty() {
+                        0.0
+                    } else {
+                        let oa_n = visible_papers
+                            .iter()
+                            .filter(|p| !matches!(p.record.oa_status, crate::models::OaStatus::Closed))
+                            .count();
+                        100.0 * (oa_n as f64) / (visible_papers.len() as f64)
+                    };
+
+                    ui.group(|ui| {
+                        ui.set_min_width(col3_w - 8.0);
+                        ui.label(
+                            RichText::new("Citation Metrics Summary")
+                                .strong()
+                                .color(Color32::from_rgb(52, 211, 153)),
+                        );
+                        ui.weak(format!(
+                            "Computed over {} matching works (horizon {})",
+                            pop.total_papers, self.params.horizon_year
+                        ));
+                        ui.add_space(4.0);
+
+                        egui::Grid::new("pop_metrics_summary_grid")
+                            .num_columns(4)
+                            .striped(true)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.weak("Total Papers:");
+                                ui.monospace(format!("{}", pop.total_papers));
+                                ui.weak("Total Citations:");
+                                ui.monospace(format!("{}", pop.total_citations));
+                                ui.end_row();
+
+                                ui.weak("Cites/Year:");
+                                ui.monospace(format!("{:.2}", pop.cites_per_year));
+                                ui.weak("Cites/Paper:");
+                                ui.monospace(format!("{:.2}", pop.cites_per_paper));
+                                ui.end_row();
+
+                                ui.weak("Cites/Author:");
+                                ui.monospace(format!("{:.2}", pop.cites_per_author));
+                                ui.weak("Authors/Paper:");
+                                ui.monospace(format!("{:.2}", pop.authors_per_paper));
+                                ui.end_row();
+
+                                ui.weak("h-index:");
+                                ui.label(RichText::new(format!("{}", pop.h_index)).strong().color(Color32::from_rgb(250, 204, 21)));
+                                ui.weak("g-index:");
+                                ui.label(RichText::new(format!("{}", pop.g_index)).strong().color(Color32::from_rgb(56, 189, 248)));
+                                ui.end_row();
+
+                                ui.weak("hI,norm:");
+                                ui.monospace(format!("{}", pop.hi_norm));
+                                ui.weak("hI,annual:");
+                                ui.monospace(format!("{:.2}", pop.hi_annual));
+                                ui.end_row();
+
+                                ui.weak("e-index:");
+                                ui.monospace(format!("{:.2}", pop.e_index));
+                                ui.weak("hA-index:");
+                                ui.monospace(format!("{}", pop.ha_index));
+                                ui.end_row();
+
+                                ui.weak("Year Span:");
+                                ui.monospace(if pop.total_papers > 0 {
+                                    format!("{}-{} ({}y)", pop.min_year, pop.max_year, pop.year_span)
+                                } else {
+                                    "-".to_string()
+                                });
+                                ui.weak("OA Share:");
+                                ui.monospace(format!("{:.0}%", oa_pct));
+                                ui.end_row();
+                            });
+                    });
+                },
+            );
         });
 
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(format!(
-                "PDF Download & Integrity Verification Log ({} entries)",
-                self.download_reports.len()
-            ))
-            .strong(),
-        );
+        ui.add_space(6.0);
+        ui.separator();
 
-        ui.push_id("download_log_scroll", |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("download_reports_grid")
+        // --------------------------------------------------------------------
+        // BOTTOM: Sortable Publish-or-Perish Results Table + Graph Launcher
+        // --------------------------------------------------------------------
+        let mut rows: Vec<(usize, u64, f64, &'static str)> = self
+            .analytics
+            .papers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.matches_paper_filter(p))
+            .map(|(i, p)| {
+                let cites = effective_record_citations(&p.record, p.in_deg);
+                let age = (self.params.horizon_year - p.record.year + 1).max(1) as f64;
+                let cpy = (cites as f64) / age;
+                let src_db = Self::infer_paper_source_db(&p.record);
+                (i, cites, cpy, src_db)
+            })
+            .collect();
+
+        let sort_asc = self.pop_sort_asc;
+        let sort_col = self.pop_sort_col;
+        let papers_ref = &self.analytics.papers;
+        rows.sort_by(|a, b| {
+            let pa = &papers_ref[a.0].record;
+            let pb = &papers_ref[b.0].record;
+            let ord = match sort_col {
+                PopSortColumn::Cites => a.1.cmp(&b.1),
+                PopSortColumn::CitesPerYear => a.2.total_cmp(&b.2),
+                PopSortColumn::Authors => pa.authors.to_ascii_lowercase().cmp(&pb.authors.to_ascii_lowercase()),
+                PopSortColumn::Title => pa.title.to_ascii_lowercase().cmp(&pb.title.to_ascii_lowercase()),
+                PopSortColumn::Year => pa.year.cmp(&pb.year),
+                PopSortColumn::Venue => pa.venue.to_ascii_lowercase().cmp(&pb.venue.to_ascii_lowercase()),
+                PopSortColumn::SourceDb => a.3.cmp(b.3),
+                PopSortColumn::Doi => pa.doi.cmp(&pb.doi),
+            };
+            if sort_asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            let build_btn = egui::Button::new(
+                RichText::new("Build & Open Interactive Citation Graph ->")
+                    .strong()
+                    .color(Color32::WHITE),
+            )
+            .fill(Color32::from_rgb(37, 99, 235));
+            if ui.add(build_btn).clicked() {
+                self.recompute_all();
+                self.graph_viewer
+                    .sync_with_analytics(&self.analytics, &self.focused_paper_id);
+                self.rebuild_cpu_pick_grid();
+                self.bump_gpu_revision();
+                self.domain = ActiveDomain::NetworkGraphViewer;
+            }
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "Search Results ({} / {} works) — click column headers to sort",
+                    rows.len(),
+                    self.analytics.papers.len()
+                ))
+                .strong(),
+            );
+            if !self.download_reports.is_empty() {
+                ui.weak(format!("| PDF log: {} downloads", self.download_reports.len()));
+            }
+        });
+
+        ui.add_space(4.0);
+        ui.push_id("pop_results_scroll", |ui| {
+            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                let col_btn = |ui: &mut egui::Ui, cur: PopSortColumn, asc: bool, target: PopSortColumn, name: &str| {
+                    let label = if cur == target {
+                        format!("{} {}", name, if asc { "[^]" } else { "[v]" })
+                    } else {
+                        name.to_string()
+                    };
+                    ui.small_button(RichText::new(label).strong()).clicked()
+                };
+
+                let mut toggle_col = None;
+                egui::Grid::new("pop_results_table")
                     .striped(true)
-                    .num_columns(6)
+                    .num_columns(8)
+                    .spacing([12.0, 5.0])
                     .show(ui, |ui| {
-                        ui.strong("Paper ID");
-                        ui.strong("DOI");
-                        ui.strong("Stage");
-                        ui.strong("Status");
-                        ui.strong("Size (KB)");
-                        ui.strong("SHA-256 / Saved File");
+                        if col_btn(ui, self.pop_sort_col, self.pop_sort_asc, PopSortColumn::Cites, "Cites") {
+                            toggle_col = Some(PopSortColumn::Cites);
+                        }
+                        if col_btn(ui, self.pop_sort_col, self.pop_sort_asc, PopSortColumn::CitesPerYear, "Cites/Yr") {
+                            toggle_col = Some(PopSortColumn::CitesPerYear);
+                        }
+                        if col_btn(ui, self.pop_sort_col, self.pop_sort_asc, PopSortColumn::Authors, "Authors") {
+                            toggle_col = Some(PopSortColumn::Authors);
+                        }
+                        if col_btn(ui, self.pop_sort_col, self.pop_sort_asc, PopSortColumn::Title, "Title") {
+                            toggle_col = Some(PopSortColumn::Title);
+                        }
+                        if col_btn(ui, self.pop_sort_col, self.pop_sort_asc, PopSortColumn::Year, "Year") {
+                            toggle_col = Some(PopSortColumn::Year);
+                        }
+                        if col_btn(ui, self.pop_sort_col, self.pop_sort_asc, PopSortColumn::Venue, "Venue") {
+                            toggle_col = Some(PopSortColumn::Venue);
+                        }
+                        if col_btn(ui, self.pop_sort_col, self.pop_sort_asc, PopSortColumn::SourceDb, "Source DB") {
+                            toggle_col = Some(PopSortColumn::SourceDb);
+                        }
+                        if col_btn(ui, self.pop_sort_col, self.pop_sort_asc, PopSortColumn::Doi, "DOI / PDF") {
+                            toggle_col = Some(PopSortColumn::Doi);
+                        }
                         ui.end_row();
 
-                        for r in &self.download_reports {
-                            if ui.small_button(&r.paper_id).clicked() {
-                                self.focused_paper_id = r.paper_id.clone();
+                        for &(p_idx, cites, cpy, src_db) in &rows {
+                            let p = &self.analytics.papers[p_idx];
+                            let rec = &p.record;
+                            let is_sel = self.focused_paper_id == rec.id;
+
+                            ui.monospace(format!("{}", cites));
+                            ui.monospace(format!("{:.1}", cpy));
+
+                            let auth_short = if rec.authors.chars().count() > 28 {
+                                format!("{}...", rec.authors.chars().take(26).collect::<String>())
+                            } else {
+                                rec.authors.clone()
+                            };
+                            ui.label(auth_short);
+
+                            let title_short = if rec.title.chars().count() > 62 {
+                                format!("{}...", rec.title.chars().take(60).collect::<String>())
+                            } else {
+                                rec.title.clone()
+                            };
+                            if ui.selectable_label(is_sel, title_short).clicked() {
+                                self.focused_paper_id = rec.id.clone();
                                 self.show_dossier_panel = true;
                             }
-                            ui.monospace(if r.doi.is_empty() { "-" } else { &r.doi });
-                            ui.monospace(&r.resolved_stage);
-                            let st_col = if r.status.is_ok() {
-                                Color32::from_rgb(52, 211, 153)
+
+                            ui.monospace(format!("{}", rec.year));
+
+                            let venue_short = if rec.venue.chars().count() > 28 {
+                                format!("{}...", rec.venue.chars().take(26).collect::<String>())
                             } else {
-                                Color32::from_rgb(248, 113, 113)
+                                rec.venue.clone()
                             };
-                            ui.colored_label(st_col, r.status.label());
-                            ui.monospace(format!("{:.1}", (r.byte_len as f64) / 1024.0));
-                            let info = match (&r.sha256, &r.saved_path) {
-                                (Some(sha), Some(p)) => {
-                                    format!("{}.. -> {}", &sha[..sha.len().min(10)], p)
-                                }
-                                _ => "-".to_string(),
+                            ui.label(venue_short);
+
+                            ui.colored_label(Color32::from_rgb(125, 211, 252), src_db);
+
+                            let doi_pdf = if !rec.doi.is_empty() && !rec.oa_pdf_url.is_empty() {
+                                format!("{} [PDF]", rec.doi)
+                            } else if !rec.doi.is_empty() {
+                                rec.doi.clone()
+                            } else if !rec.arxiv_id.is_empty() {
+                                format!("arXiv:{}", rec.arxiv_id)
+                            } else {
+                                "-".to_string()
                             };
-                            ui.monospace(info);
+                            ui.monospace(doi_pdf);
                             ui.end_row();
                         }
                     });
+                if let Some(col) = toggle_col {
+                    self.toggle_pop_sort(col);
+                }
             });
         });
     }

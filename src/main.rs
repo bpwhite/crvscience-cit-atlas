@@ -507,6 +507,7 @@ fn main() {
                 polite_email: email.clone(),
                 snowball_hops,
                 crawl,
+                ..SearchRequest::default()
             };
             run_harvest_pipeline(
                 req,
@@ -578,6 +579,7 @@ fn main() {
                     openaire_token: String::new(),
                     nasa_ads_token: String::new(),
                 },
+                ..SearchRequest::default()
             };
             run_harvest_pipeline(
                 req,
