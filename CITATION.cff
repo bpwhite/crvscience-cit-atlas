@@ -8,7 +8,7 @@ identifiers:
   - type: doi
     value: "10.5281/zenodo.24222380"
     description: "Zenodo Concept DOI for CRV Science Apps Preprint APP-PREPRINT-05"
-license: MIT
+license: "GPL-3.0-or-later"
 repository-code: "https://github.com/bpwhite/crvscience-cit-atlas"
 url: "https://crvscience.com/apps"
 authors:
