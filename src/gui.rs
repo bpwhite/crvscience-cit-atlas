@@ -115,6 +115,13 @@ enum WorkerEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DossierSelection {
+    Paper(String),
+    DataCiteArtifact(String),
+    BioEntity(BioEntityKind, String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOutcomeFilter {
     All,
@@ -148,7 +155,9 @@ pub struct CitAtlasApp {
     pub disc_filter: Option<Discipline>,
     pub filter_text: String,
     pub focused_paper_id: String,
+    pub dossier_selection: DossierSelection,
     pub show_dossier_panel: bool,
+    pub show_about_window: bool,
     pub status_banner: String,
 
     // Velocity tab
@@ -261,7 +270,9 @@ impl CitAtlasApp {
             disc_filter: None,
             filter_text: String::new(),
             focused_paper_id: "shannon1948".to_string(),
+            dossier_selection: DossierSelection::Paper("shannon1948".to_string()),
             show_dossier_panel: false,
+            show_about_window: false,
             status_banner: "Ready — 47 verified landmark papers and 78 citation edges loaded.".to_string(),
             compared_ids: vec![
                 "shannon1948".to_string(),
@@ -328,6 +339,12 @@ impl CitAtlasApp {
         app
     }
 
+    pub fn select_paper(&mut self, id: String) {
+        self.focused_paper_id = id.clone();
+        self.dossier_selection = DossierSelection::Paper(id);
+        self.show_dossier_panel = true;
+    }
+
     fn recompute_all(&mut self) {
         self.analytics = compute_corpus_analytics(&self.raw_papers, &self.raw_edges, &self.params);
         if self.selected_window_idx >= self.analytics.windows.len() {
@@ -342,6 +359,9 @@ impl CitAtlasApp {
                 .collect();
             if !valid_ids.contains(self.focused_paper_id.as_str()) {
                 self.focused_paper_id = self.analytics.papers[0].record.id.clone();
+                if matches!(self.dossier_selection, DossierSelection::Paper(_)) {
+                    self.dossier_selection = DossierSelection::Paper(self.focused_paper_id.clone());
+                }
             }
             if !valid_ids.contains(self.path_src_id.as_str()) {
                 self.path_src_id = self.analytics.papers.last().unwrap().record.id.clone();
@@ -635,7 +655,8 @@ impl CitAtlasApp {
                             }
                             self.raw_papers = merged_p;
                             self.raw_edges = merged_e;
-                            self.focused_paper_id = new_id;
+                            self.focused_paper_id = new_id.clone();
+                            self.dossier_selection = DossierSelection::Paper(new_id);
                             self.recompute_all();
                             self.status_banner = "Resolved DOI and linked references into active graph.".to_string();
                         }
@@ -946,6 +967,7 @@ impl CitAtlasApp {
         self.graph_viewer.physics_running = false;
         self.show_dossier_panel = true;
         self.focused_paper_id = "shannon1948".to_string();
+        self.dossier_selection = DossierSelection::Paper("shannon1948".to_string());
         self.recompute_layout();
         self.graph_viewer
             .sync_with_analytics(&self.analytics, &self.focused_paper_id);
@@ -967,6 +989,7 @@ impl CitAtlasApp {
                 self.vel_metric = VelocityPlotMetric::DecayVelocity;
                 self.show_awakening_quadrant = false;
                 self.focused_paper_id = "ke2015".to_string();
+                self.dossier_selection = DossierSelection::Paper("ke2015".to_string());
                 self.show_dossier_panel = true;
             }
             _ => {
@@ -1134,17 +1157,77 @@ impl CitAtlasApp {
         // Bottom Status Bar
         egui::TopBottomPanel::bottom("cit_atlas_status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if self.is_busy {
-                    ui.spinner();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("About").clicked() {
+                        self.show_about_window = !self.show_about_window;
+                    }
+                    ui.separator();
                     ui.label(
-                        RichText::new(&self.busy_label)
-                            .color(Color32::from_rgb(250, 204, 21)),
+                        RichText::new("Copyright CRV Science Network")
+                            .size(11.5)
+                            .color(Color32::from_rgb(148, 163, 184)),
                     );
-                } else {
-                    ui.label(RichText::new(&self.status_banner).size(11.5));
-                }
+                    ui.separator();
+                    let left_w = ui.available_width().max(80.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(left_w, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if self.is_busy {
+                                ui.spinner();
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&self.busy_label)
+                                            .color(Color32::from_rgb(250, 204, 21)),
+                                    )
+                                    .truncate(),
+                                );
+                            } else {
+                                ui.add(
+                                    egui::Label::new(RichText::new(&self.status_banner).size(11.5))
+                                        .truncate(),
+                                );
+                            }
+                        },
+                    );
+                });
             });
         });
+
+        if self.show_about_window {
+            let mut open = self.show_about_window;
+            egui::Window::new("About CitAtlas")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.heading(
+                        RichText::new("CitAtlas (cit-atlas v1.8.0)")
+                            .color(Color32::from_rgb(56, 189, 248)),
+                    );
+                    ui.label("Native Citations Analytics & Literature Harvester");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Copyright CRV Science Network").strong());
+                    ui.label("License: GNU General Public License v3.0 or later (GPL-3.0-or-later)");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Website:");
+                        ui.hyperlink_to("https://crvscience.com", "https://crvscience.com");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Apps Directory:");
+                        ui.hyperlink_to("https://crvscience.com/apps", "https://crvscience.com/apps");
+                    });
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        self.show_about_window = false;
+                    }
+                });
+            if !open {
+                self.show_about_window = false;
+            }
+        }
 
         // Right-hand Focal Paper Dossier Drawer
         if self.show_dossier_panel {
@@ -1184,14 +1267,191 @@ impl CitAtlasApp {
 
 impl CitAtlasApp {
     fn ui_dossier_panel(&mut self, ui: &mut egui::Ui) {
+        match self.dossier_selection.clone() {
+            DossierSelection::DataCiteArtifact(doi) => {
+                ui.heading("DataCite Artifact Dossier");
+                ui.separator();
+                if ui.small_button("<- Back to Focal Paper").clicked() {
+                    self.dossier_selection = DossierSelection::Paper(self.focused_paper_id.clone());
+                }
+                ui.add_space(4.0);
+
+                let art_opt = self
+                    .graph_viewer
+                    .artifact_nodes
+                    .iter()
+                    .find(|a| a.artifact_doi.eq_ignore_ascii_case(&doi))
+                    .cloned();
+
+                if let Some(art) = art_opt {
+                    let badge_col = if art.kind.is_software_like() {
+                        Color32::from_rgb(167, 139, 250)
+                    } else {
+                        Color32::from_rgb(45, 212, 191)
+                    };
+                    ui.colored_label(
+                        badge_col,
+                        RichText::new(format!("[DataCite {}]", art.kind.as_str())).strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&art.title).strong().size(13.5));
+                    ui.hyperlink_to(&art.artifact_doi, format!("https://doi.org/{}", art.artifact_doi));
+                    ui.add_space(4.0);
+                    egui::Grid::new("datacite_dossier_grid")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("Repository:");
+                            ui.monospace(&art.repository);
+                            ui.end_row();
+                            ui.label("Artifact Kind:");
+                            ui.monospace(art.kind.as_str());
+                            ui.end_row();
+                            ui.label("Downloads:");
+                            ui.monospace(format!("{}", art.downloads));
+                            ui.end_row();
+                            ui.label("Linked Papers:");
+                            ui.monospace(format!("{}", art.linked_paper_indices.len()));
+                            ui.end_row();
+                        });
+                    ui.separator();
+                    ui.label(RichText::new("Linked Papers in Corpus").strong());
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for &p_idx in &art.linked_paper_indices {
+                            if let Some(pm) = self.analytics.papers.get(p_idx) {
+                                let pid = pm.record.id.clone();
+                                if ui
+                                    .small_button(format!(
+                                        "[{} {}] {}",
+                                        pm.record.disc.code(),
+                                        pm.record.year,
+                                        pm.record.title
+                                    ))
+                                    .clicked()
+                                {
+                                    self.select_paper(pid);
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    ui.weak(format!("DataCite artifact {} not in active corpus.", doi));
+                }
+                return;
+            }
+            DossierSelection::BioEntity(kind, eid) => {
+                ui.heading("Bio-Entity Bridge Dossier");
+                ui.separator();
+                if ui.small_button("<- Back to Focal Paper").clicked() {
+                    self.dossier_selection = DossierSelection::Paper(self.focused_paper_id.clone());
+                }
+                ui.add_space(4.0);
+
+                let bio_opt = self
+                    .graph_viewer
+                    .bio_entity_nodes
+                    .iter()
+                    .find(|b| b.kind == kind && b.entity_id.eq_ignore_ascii_case(&eid))
+                    .cloned();
+
+                if let Some(bn) = bio_opt {
+                    let [cr, cg, cb] = bn.kind.rgb();
+                    ui.colored_label(
+                        Color32::from_rgb(cr, cg, cb),
+                        RichText::new(format!("[{} · {}]", bn.kind.short_badge(), bn.provider)).strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&bn.label).strong().size(13.5));
+                    if !bn.uri.is_empty() {
+                        ui.hyperlink_to(&bn.entity_id, &bn.uri);
+                    } else {
+                        ui.monospace(&bn.entity_id);
+                    }
+                    ui.add_space(4.0);
+                    egui::Grid::new("bio_dossier_grid")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("Entity Kind:");
+                            ui.monospace(bn.kind.as_str());
+                            ui.end_row();
+                            ui.label("Provider:");
+                            ui.monospace(&bn.provider);
+                            ui.end_row();
+                            ui.label("Total Mentions:");
+                            ui.monospace(format!("{}", bn.total_mentions));
+                            ui.end_row();
+                            if let Some(res) = bn.resolution_angstrom {
+                                ui.label("Resolution:");
+                                ui.monospace(format!("{:.2} A", res));
+                                ui.end_row();
+                            }
+                            ui.label("Linked Papers:");
+                            ui.monospace(format!("{}", bn.linked_paper_indices.len()));
+                            ui.end_row();
+                        });
+
+                    if !bn.linked_pdb_ids.is_empty() {
+                        ui.separator();
+                        ui.label(RichText::new("Linked PDB Structures").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            for pdb_id in &bn.linked_pdb_ids {
+                                if ui.small_button(format!("[PDB] {}", pdb_id)).clicked() {
+                                    self.dossier_selection = DossierSelection::BioEntity(
+                                        BioEntityKind::PdbStructure,
+                                        pdb_id.clone(),
+                                    );
+                                }
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                    ui.label(RichText::new("Linked Papers in Corpus").strong());
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for &p_idx in &bn.linked_paper_indices {
+                            if let Some(pm) = self.analytics.papers.get(p_idx) {
+                                let pid = pm.record.id.clone();
+                                if ui
+                                    .small_button(format!(
+                                        "[{} {}] {}",
+                                        pm.record.disc.code(),
+                                        pm.record.year,
+                                        pm.record.title
+                                    ))
+                                    .clicked()
+                                {
+                                    self.select_paper(pid);
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    ui.weak(format!("Bio-entity {}:{} not in active corpus.", kind.short_badge(), eid));
+                }
+                return;
+            }
+            DossierSelection::Paper(_) => {}
+        }
+
         ui.heading("Focal Paper Dossier");
         ui.separator();
 
+        let target_id = match &self.dossier_selection {
+            DossierSelection::Paper(pid) => pid.as_str(),
+            _ => self.focused_paper_id.as_str(),
+        };
         let Some(p) = self
             .analytics
             .papers
             .iter()
-            .find(|x| x.record.id == self.focused_paper_id)
+            .find(|x| x.record.id == target_id)
+            .or_else(|| {
+                self.analytics
+                    .papers
+                    .iter()
+                    .find(|x| x.record.id == self.focused_paper_id)
+            })
             .cloned()
         else {
             ui.label("Select any paper node or row to inspect.");
@@ -1342,6 +1602,14 @@ impl CitAtlasApp {
                 ui.monospace(format!("{:+.3}", p.disruption_cd));
                 ui.end_row();
 
+                ui.label("Disruption CD5 (5yr):");
+                ui.monospace(format!("{:+.3}", p.disruption_cd5));
+                ui.end_row();
+
+                ui.label("HITS Hub / Authority:");
+                ui.monospace(format!("H={:.4} · A={:.4}", p.hits_hub, p.hits_authority));
+                ui.end_row();
+
                 ui.label("Brandes Geodesic CB_u:");
                 ui.monospace(format!("{:.2}%", p.cb_undir * 100.0));
                 ui.end_row();
@@ -1413,6 +1681,10 @@ impl CitAtlasApp {
                             ui.monospace(format!("[{} · {}]", lk.artifact_kind.as_str(), lk.relation_type));
                             ui.hyperlink_to(&lk.artifact_doi, format!("https://doi.org/{}", lk.artifact_doi));
                             ui.weak(format!("({} dl)", lk.download_count));
+                            if ui.small_button("Inspect").clicked() {
+                                self.dossier_selection =
+                                    DossierSelection::DataCiteArtifact(lk.artifact_doi.clone());
+                            }
                         });
                     }
                     ui.separator();
@@ -1437,6 +1709,10 @@ impl CitAtlasApp {
                             } else if b.mention_count > 1 {
                                 ui.weak(format!("({}x)", b.mention_count));
                             }
+                            if ui.small_button("Inspect").clicked() {
+                                self.dossier_selection =
+                                    DossierSelection::BioEntity(b.kind, b.entity_id.clone());
+                            }
                         });
                     }
                     ui.separator();
@@ -1447,6 +1723,7 @@ impl CitAtlasApp {
                     ui.separator();
                 }
                 ui.label(RichText::new("Incoming Citers in Graph").strong());
+                let mut next_focus: Option<String> = None;
                 let citers = &self.analytics.in_adj[p.idx];
                 if citers.is_empty() {
                     ui.weak("None within active horizon.");
@@ -1462,7 +1739,7 @@ impl CitAtlasApp {
                             ))
                             .clicked()
                         {
-                            self.focused_paper_id = cp.record.id.clone();
+                            next_focus = Some(cp.record.id.clone());
                         }
                     }
                 }
@@ -1484,9 +1761,12 @@ impl CitAtlasApp {
                             ))
                             .clicked()
                         {
-                            self.focused_paper_id = rp.record.id.clone();
+                            next_focus = Some(rp.record.id.clone());
                         }
                     }
+                }
+                if let Some(fid) = next_focus {
+                    self.select_paper(fid);
                 }
             });
         });
@@ -1594,48 +1874,55 @@ impl CitAtlasApp {
         });
 
         ui.push_id("observatory_table_scroll", |ui| {
-            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                egui::Grid::new("observatory_grid")
-                    .striped(true)
-                    .num_columns(10)
-                    .show(ui, |ui| {
-                        ui.strong("Paper");
-                        ui.strong("Disc");
-                        ui.strong("Year");
-                        ui.strong("In-Cites");
-                        ui.strong("v_exp");
-                        ui.strong("dv/dt");
-                        ui.strong("Beauty B");
-                        ui.strong("CD");
-                        ui.strong("CB_u");
-                        ui.strong("Part P_i");
-                        ui.end_row();
-
-                        for p in filtered.iter().take(250) {
-                            let [r, g, b] = p.record.disc.rgb();
-                            if ui
-                                .selectable_label(
-                                    self.focused_paper_id == p.record.id,
-                                    &p.record.title,
-                                )
-                                .clicked()
-                            {
-                                self.focused_paper_id = p.record.id.clone();
-                                self.show_dossier_panel = true;
-                            }
-                            ui.colored_label(Color32::from_rgb(r, g, b), p.record.disc.code());
-                            ui.monospace(format!("{}", p.record.year));
-                            ui.monospace(format!("{}", p.in_deg));
-                            ui.monospace(format!("{:.2}", p.v_exp));
-                            ui.monospace(format!("{:+.2}", p.accel));
-                            ui.monospace(format!("{:.1}", p.beauty_b));
-                            ui.monospace(format!("{:+.2}", p.disruption_cd));
-                            ui.monospace(format!("{:.1}%", p.cb_undir * 100.0));
-                            ui.monospace(format!("{:.2}", p.part_p));
+            egui::ScrollArea::both()
+                .max_height((ui.available_height() - 6.0).max(200.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("observatory_grid")
+                        .striped(true)
+                        .num_columns(12)
+                        .show(ui, |ui| {
+                            ui.strong("Paper");
+                            ui.strong("Disc");
+                            ui.strong("Year");
+                            ui.strong("In-Cites");
+                            ui.strong("v_exp");
+                            ui.strong("dv/dt");
+                            ui.strong("Beauty B");
+                            ui.strong("CD5");
+                            ui.strong("HITS Hub");
+                            ui.strong("HITS Auth");
+                            ui.strong("CB_u");
+                            ui.strong("Part P_i");
                             ui.end_row();
-                        }
-                    });
-            });
+
+                            for p in filtered.iter().take(250) {
+                                let [r, g, b] = p.record.disc.rgb();
+                                if ui
+                                    .selectable_label(
+                                        self.focused_paper_id == p.record.id,
+                                        &p.record.title,
+                                    )
+                                    .clicked()
+                                {
+                                    self.select_paper(p.record.id.clone());
+                                }
+                                ui.colored_label(Color32::from_rgb(r, g, b), p.record.disc.code());
+                                ui.monospace(format!("{}", p.record.year));
+                                ui.monospace(format!("{}", p.in_deg));
+                                ui.monospace(format!("{:.2}", p.v_exp));
+                                ui.monospace(format!("{:+.2}", p.accel));
+                                ui.monospace(format!("{:.1}", p.beauty_b));
+                                ui.monospace(format!("{:+.2}", p.disruption_cd5));
+                                ui.monospace(format!("{:.3}", p.hits_hub));
+                                ui.monospace(format!("{:.3}", p.hits_authority));
+                                ui.monospace(format!("{:.1}%", p.cb_undir * 100.0));
+                                ui.monospace(format!("{:.2}", p.part_p));
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                });
         });
     }
 
@@ -1776,8 +2063,7 @@ impl CitAtlasApp {
             }
         }
         if let Some(fid) = next_focus {
-            self.focused_paper_id = fid;
-            self.show_dossier_panel = true;
+            self.select_paper(fid);
         }
     }
 
@@ -1880,44 +2166,58 @@ impl CitAtlasApp {
                 .button(RichText::new("Export .graphml").strong())
                 .clicked()
             {
-                self.sync_gpu_mirror_into_viewer();
-                let p = std::path::Path::new("cit_atlas_network.graphml");
-                match export_graphml(
-                    &self.raw_papers,
-                    &self.raw_edges,
-                    &self.analytics,
-                    Some(&self.graph_viewer.positions),
-                    self.graph_viewer.color_by,
-                    self.graph_viewer.show_datacite_diamonds || self.graph_viewer.show_bio_entity_nodes,
-                    p,
-                ) {
-                    Ok(_) => {
-                        self.status_banner =
-                            "Exported cit_atlas_network.graphml with live viewer coordinates & 34 attributes.".to_string();
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("GraphML Network", &["graphml"])
+                    .set_file_name("cit_atlas_network.graphml")
+                    .save_file()
+                {
+                    self.sync_gpu_mirror_into_viewer();
+                    match export_graphml(
+                        &self.raw_papers,
+                        &self.raw_edges,
+                        &self.analytics,
+                        Some(&self.graph_viewer.positions),
+                        self.graph_viewer.color_by,
+                        self.graph_viewer.show_datacite_diamonds || self.graph_viewer.show_bio_entity_nodes,
+                        &p,
+                    ) {
+                        Ok(_) => {
+                            self.status_banner = format!(
+                                "Exported {} with live viewer coordinates & graph attributes.",
+                                p.display()
+                            );
+                        }
+                        Err(e) => self.status_banner = e,
                     }
-                    Err(e) => self.status_banner = e,
                 }
             }
             if ui
                 .button(RichText::new("Export .gexf").strong())
                 .clicked()
             {
-                self.sync_gpu_mirror_into_viewer();
-                let p = std::path::Path::new("cit_atlas_network.gexf");
-                match export_gexf(
-                    &self.raw_papers,
-                    &self.raw_edges,
-                    &self.analytics,
-                    Some(&self.graph_viewer.positions),
-                    self.graph_viewer.color_by,
-                    self.graph_viewer.show_datacite_diamonds || self.graph_viewer.show_bio_entity_nodes,
-                    p,
-                ) {
-                    Ok(_) => {
-                        self.status_banner =
-                            "Exported cit_atlas_network.gexf (Gephi 1.3 viz colors, sizes & coordinates).".to_string();
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Gephi GEXF 1.3", &["gexf"])
+                    .set_file_name("cit_atlas_network.gexf")
+                    .save_file()
+                {
+                    self.sync_gpu_mirror_into_viewer();
+                    match export_gexf(
+                        &self.raw_papers,
+                        &self.raw_edges,
+                        &self.analytics,
+                        Some(&self.graph_viewer.positions),
+                        self.graph_viewer.color_by,
+                        self.graph_viewer.show_datacite_diamonds || self.graph_viewer.show_bio_entity_nodes,
+                        &p,
+                    ) {
+                        Ok(_) => {
+                            self.status_banner = format!(
+                                "Exported {} (Gephi 1.3 viz colors, sizes & coordinates).",
+                                p.display()
+                            );
+                        }
+                        Err(e) => self.status_banner = e,
                     }
-                    Err(e) => self.status_banner = e,
                 }
             }
         });
@@ -2061,6 +2361,7 @@ impl CitAtlasApp {
                 });
             ui.checkbox(&mut self.graph_viewer.show_labels, "Labels");
             ui.checkbox(&mut self.graph_viewer.show_minimap, "Minimap");
+            ui.checkbox(&mut self.graph_viewer.show_legend, "Legend");
         });
 
         ui.collapsing("ForceAtlas2 Physics & Edge Threshold Tuning", |ui| {
@@ -2246,32 +2547,29 @@ impl CitAtlasApp {
         }
 
         if resp.clicked() {
-            let target_paper_idx = hovered_idx.or_else(|| {
-                let any_i = hovered_any_idx?;
-                if any_i >= n && any_i < n + n_art_vis {
-                    self.graph_viewer.artifact_nodes[any_i - n]
-                        .linked_paper_indices
-                        .first()
-                        .copied()
-                } else if any_i >= n + n_art_vis && any_i < total_vis_nodes {
-                    self.graph_viewer.bio_entity_nodes[any_i - n - n_art_vis]
-                        .linked_paper_indices
-                        .first()
-                        .copied()
-                } else {
-                    None
-                }
-            });
-            if let Some(p_idx) = target_paper_idx {
-                let new_focus = self.analytics.papers[p_idx].record.id.clone();
-                if self.focused_paper_id != new_focus {
-                    self.focused_paper_id = new_focus;
-                    self.show_dossier_panel = true;
+            if let Some(h_idx) = hovered_idx {
+                let new_focus = self.analytics.papers[h_idx].record.id.clone();
+                let changed = self.focused_paper_id != new_focus;
+                self.select_paper(new_focus);
+                if changed {
                     if self.graph_viewer.layout == ViewerLayoutPreset::RadialEgo {
                         self.graph_viewer
                             .recompute_preset_layout(&self.analytics, &self.focused_paper_id);
                     }
                     self.bump_gpu_revision();
+                }
+            } else if let Some(any_i) = hovered_any_idx {
+                if any_i >= n && any_i < n + n_art_vis {
+                    let doi = self.graph_viewer.artifact_nodes[any_i - n]
+                        .artifact_doi
+                        .clone();
+                    self.dossier_selection = DossierSelection::DataCiteArtifact(doi);
+                    self.show_dossier_panel = true;
+                } else if any_i >= n + n_art_vis && any_i < total_vis_nodes {
+                    let bn = &self.graph_viewer.bio_entity_nodes[any_i - n - n_art_vis];
+                    self.dossier_selection =
+                        DossierSelection::BioEntity(bn.kind, bn.entity_id.clone());
+                    self.show_dossier_panel = true;
                 }
             }
         }
@@ -2448,17 +2746,17 @@ impl CitAtlasApp {
             let hp = &self.analytics.papers[h_idx];
             Some((
                 format!(
-                    "{} [{} · L{} · M{}]\n{}\nCB_u={:.2}% · v_exp={:.2} · UniProt={} · PDB={} · EPMC={} · Integrity={}",
+                    "{} [{} · L{} · M{}]\n{}\nCB_u={:.2}% · CD5={:+.2} · H={:.3} · A={:.3} · v_exp={:.2} · {}",
                     hp.record.short_cite(),
                     hp.record.disc.code(),
                     hp.louvain_comm + 1,
                     hp.infomap_comm + 1,
                     hp.record.title,
                     hp.cb_undir * 100.0,
+                    hp.disruption_cd5,
+                    hp.hits_hub,
+                    hp.hits_authority,
                     hp.v_exp,
-                    hp.uniprot_bridge_count,
-                    hp.pdb_bridge_count,
-                    hp.epmc_annotation_count,
                     hp.record.retraction.status.as_str()
                 ),
                 Color32::from_rgb(56, 189, 248),
@@ -2578,6 +2876,189 @@ impl CitAtlasApp {
                 egui::StrokeKind::Inside,
             );
         }
+
+        if self.graph_viewer.show_legend {
+            self.paint_network_canvas_legend(&painter, rect);
+        }
+    }
+
+    fn paint_network_canvas_legend(&self, painter: &egui::Painter, rect: Rect) {
+        if rect.width() < 460.0 || rect.height() < 280.0 {
+            return;
+        }
+        let show_dc = self.graph_viewer.show_datacite_diamonds;
+        let show_bio = self.graph_viewer.show_bio_entity_nodes;
+        let mut rows: usize = 3; // Paper + Rings + Edges
+        if show_dc {
+            rows += 1;
+        }
+        if show_bio {
+            rows += 2;
+        }
+        let leg_w = 248.0f32.min(rect.width() - 180.0).max(196.0);
+        let leg_h = 26.0 + (rows as f32) * 18.0;
+        let leg_rect = Rect::from_min_size(
+            Pos2::new(rect.left() + 10.0, rect.bottom() - leg_h - 10.0),
+            Vec2::new(leg_w, leg_h),
+        );
+        painter.rect_filled(leg_rect, 5.0, Color32::from_rgba_unmultiplied(15, 23, 42, 245));
+        painter.rect_stroke(
+            leg_rect,
+            5.0,
+            Stroke::new(1.0, Color32::from_rgb(51, 65, 85)),
+            egui::StrokeKind::Inside,
+        );
+
+        let color_mode_lbl = match self.graph_viewer.color_by {
+            NodeColorEncoding::Discipline => "Discipline",
+            NodeColorEncoding::LouvainCommunity => "Louvain Q",
+            NodeColorEncoding::InfomapModule => "Infomap",
+            NodeColorEncoding::VelocityVExp => "Velocity",
+            NodeColorEncoding::SleepingBeautyB => "Beauty B",
+            NodeColorEncoding::IntegrityStatus => "Integrity",
+            NodeColorEncoding::BioEntityRichness => "Bio-Rich",
+        };
+        painter.text(
+            Pos2::new(leg_rect.left() + 9.0, leg_rect.top() + 12.0),
+            Align2::LEFT_CENTER,
+            format!("Graph Legend ({})", color_mode_lbl),
+            FontId::monospace(10.5),
+            Color32::from_rgb(226, 232, 240),
+        );
+
+        let mut y = leg_rect.top() + 28.0;
+        let sx = leg_rect.left() + 16.0;
+        let tx = leg_rect.left() + 28.0;
+        let label_col = Color32::from_rgb(203, 213, 225);
+
+        // Row 1: Paper circle
+        painter.circle_filled(Pos2::new(sx, y), 4.5, Color32::from_rgb(56, 189, 248));
+        painter.circle_stroke(Pos2::new(sx, y), 4.5, Stroke::new(1.0, Color32::WHITE));
+        painter.text(
+            Pos2::new(tx, y),
+            Align2::LEFT_CENTER,
+            "Paper Node (click for dossier)",
+            FontId::proportional(10.5),
+            label_col,
+        );
+        y += 18.0;
+
+        if show_dc {
+            let d = 4.8f32;
+            let ds_pos = Pos2::new(sx, y);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(ds_pos.x, ds_pos.y - d),
+                    Pos2::new(ds_pos.x + d, ds_pos.y),
+                    Pos2::new(ds_pos.x, ds_pos.y + d),
+                    Pos2::new(ds_pos.x - d, ds_pos.y),
+                ],
+                Color32::from_rgb(45, 212, 191),
+                Stroke::new(0.8, Color32::WHITE),
+            ));
+            let sw_pos = Pos2::new(sx + 13.0, y);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(sw_pos.x, sw_pos.y - d),
+                    Pos2::new(sw_pos.x + d, sw_pos.y),
+                    Pos2::new(sw_pos.x, sw_pos.y + d),
+                    Pos2::new(sw_pos.x - d, sw_pos.y),
+                ],
+                Color32::from_rgb(167, 139, 250),
+                Stroke::new(0.8, Color32::WHITE),
+            ));
+            painter.text(
+                Pos2::new(tx + 12.0, y),
+                Align2::LEFT_CENTER,
+                "DataCite Dataset / Software",
+                FontId::proportional(10.5),
+                label_col,
+            );
+            y += 18.0;
+        }
+
+        if show_bio {
+            let d = 4.8f32;
+            let hex: Vec<Pos2> = (0..6)
+                .map(|k| {
+                    let a = (k as f32) * std::f32::consts::FRAC_PI_3;
+                    Pos2::new(sx + a.cos() * d, y + a.sin() * d)
+                })
+                .collect();
+            painter.add(egui::Shape::convex_polygon(
+                hex,
+                Color32::from_rgb(245, 158, 11),
+                Stroke::new(0.8, Color32::WHITE),
+            ));
+            let oct_x = sx + 13.0;
+            let oct: Vec<Pos2> = (0..8)
+                .map(|k| {
+                    let a = (k as f32) * std::f32::consts::FRAC_PI_4 + 0.39;
+                    Pos2::new(oct_x + a.cos() * d, y + a.sin() * d)
+                })
+                .collect();
+            painter.add(egui::Shape::convex_polygon(
+                oct,
+                Color32::from_rgb(6, 182, 212),
+                Stroke::new(0.8, Color32::WHITE),
+            ));
+            painter.text(
+                Pos2::new(tx + 12.0, y),
+                Align2::LEFT_CENTER,
+                "UniProt Hex / PDB Structure Oct",
+                FontId::proportional(10.5),
+                label_col,
+            );
+            y += 18.0;
+
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(sx, y - d),
+                    Pos2::new(sx + d * 0.95, y + d * 0.78),
+                    Pos2::new(sx - d * 0.95, y + d * 0.78),
+                ],
+                Color32::from_rgb(132, 204, 22),
+                Stroke::new(0.8, Color32::WHITE),
+            ));
+            painter.text(
+                Pos2::new(tx, y),
+                Align2::LEFT_CENTER,
+                "EPMC Ontology (GO/EFO/ChEBI)",
+                FontId::proportional(10.5),
+                label_col,
+            );
+            y += 18.0;
+        }
+
+        // Rings row: Focal / Beauty / Retracted
+        painter.circle_stroke(Pos2::new(sx, y), 4.4, Stroke::new(1.8, Color32::from_rgb(56, 189, 248)));
+        painter.circle_stroke(Pos2::new(sx + 12.0, y), 4.4, Stroke::new(1.8, Color32::from_rgb(250, 204, 21)));
+        painter.circle_stroke(Pos2::new(sx + 24.0, y), 4.4, Stroke::new(1.8, Color32::from_rgb(239, 68, 68)));
+        painter.text(
+            Pos2::new(tx + 22.0, y),
+            Align2::LEFT_CENTER,
+            "Rings: Focal / Beauty / Retracted",
+            FontId::proportional(10.5),
+            label_col,
+        );
+        y += 18.0;
+
+        // Edges row: Geodesic / Zombie / Citation
+        painter.line_segment(
+            [Pos2::new(sx - 4.0, y), Pos2::new(sx + 8.0, y)],
+            Stroke::new(2.2, Color32::from_rgb(34, 211, 238)),
+        );
+        painter.line_segment(
+            [Pos2::new(sx + 12.0, y), Pos2::new(sx + 24.0, y)],
+            Stroke::new(2.2, Color32::from_rgb(248, 113, 113)),
+        );
+        painter.text(
+            Pos2::new(tx + 18.0, y),
+            Align2::LEFT_CENTER,
+            "Edges: Geodesic / Zombie / Cite",
+            FontId::proportional(10.5),
+            label_col,
+        );
     }
 
     fn paint_interactive_network_viewer(&mut self, ui: &mut egui::Ui) {
@@ -2671,8 +3152,19 @@ impl CitAtlasApp {
         }
 
         // Hit-test pointer for hover, click selection, and individual node dragging
+        let n_art_vis = if self.graph_viewer.show_datacite_diamonds {
+            self.graph_viewer.artifact_nodes.len()
+        } else {
+            0
+        };
+        let n_bio_vis = if self.graph_viewer.show_bio_entity_nodes {
+            self.graph_viewer.bio_entity_nodes.len()
+        } else {
+            0
+        };
+        let total_vis_nodes = n + n_art_vis + n_bio_vis;
         let pointer_pos = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.hover_pos()));
-        let mut hovered_idx: Option<usize> = None;
+        let mut hovered_any_idx: Option<usize> = None;
         if let Some(pp) = pointer_pos {
             if rect.contains(pp) {
                 let mut best_d = 18.0f32;
@@ -2680,18 +3172,36 @@ impl CitAtlasApp {
                     let d = pp.distance(screen_pts[i]);
                     if d <= radii[i] + 5.0 && d < best_d {
                         best_d = d;
-                        hovered_idx = Some(i);
+                        hovered_any_idx = Some(i);
+                    }
+                }
+                if hovered_any_idx.is_none() {
+                    let mut best_bd = 12.0f32;
+                    for (k, art) in self.graph_viewer.artifact_nodes.iter().take(n_art_vis).enumerate() {
+                        let d = pp.distance(world_to_screen(art.pos[0], art.pos[1]));
+                        if d < best_bd {
+                            best_bd = d;
+                            hovered_any_idx = Some(n + k);
+                        }
+                    }
+                    for (k, bn) in self.graph_viewer.bio_entity_nodes.iter().take(n_bio_vis).enumerate() {
+                        let d = pp.distance(world_to_screen(bn.pos[0], bn.pos[1]));
+                        if d < best_bd {
+                            best_bd = d;
+                            hovered_any_idx = Some(n + n_art_vis + k);
+                        }
                     }
                 }
             }
         }
+        let hovered_idx = hovered_any_idx.filter(|&i| i < n);
         self.graph_viewer.hovered_node_id =
             hovered_idx.map(|i| self.analytics.papers[i].record.id.clone());
 
         if resp.drag_started() {
             if let Some(h_idx) = hovered_idx {
                 let nid = self.analytics.papers[h_idx].record.id.clone();
-                self.focused_paper_id = nid.clone();
+                self.select_paper(nid.clone());
                 self.graph_viewer.dragged_node_id = Some(nid);
             } else {
                 self.graph_viewer.dragged_node_id = None;
@@ -2718,11 +3228,24 @@ impl CitAtlasApp {
 
         if resp.clicked() {
             if let Some(h_idx) = hovered_idx {
-                self.focused_paper_id = self.analytics.papers[h_idx].record.id.clone();
-                self.show_dossier_panel = true;
+                let new_focus = self.analytics.papers[h_idx].record.id.clone();
+                self.select_paper(new_focus);
                 if self.graph_viewer.layout == ViewerLayoutPreset::RadialEgo {
                     self.graph_viewer
                         .recompute_preset_layout(&self.analytics, &self.focused_paper_id);
+                }
+            } else if let Some(any_i) = hovered_any_idx {
+                if any_i >= n && any_i < n + n_art_vis {
+                    let doi = self.graph_viewer.artifact_nodes[any_i - n]
+                        .artifact_doi
+                        .clone();
+                    self.dossier_selection = DossierSelection::DataCiteArtifact(doi);
+                    self.show_dossier_panel = true;
+                } else if any_i >= n + n_art_vis && any_i < total_vis_nodes {
+                    let bn = &self.graph_viewer.bio_entity_nodes[any_i - n - n_art_vis];
+                    self.dossier_selection =
+                        DossierSelection::BioEntity(bn.kind, bn.entity_id.clone());
+                    self.show_dossier_panel = true;
                 }
             }
         }
@@ -3020,21 +3543,63 @@ impl CitAtlasApp {
             }
         }
 
-        // 4. Live Hover Tooltip Overlay
-        if let Some(h_idx) = hovered_idx {
+        // 4. Live Hover Tooltip Overlay (Paper, DataCite Artifact, or Bio-Entity)
+        let tip_pair: Option<(String, Color32)> = if let Some(h_idx) = hovered_idx {
             let hp = &self.analytics.papers[h_idx];
-            let tip_txt = format!(
-                "{} [{} · L{} · M{}]\n{}\nCB_u={:.1}% · v_exp={:.2} · B={:.1} · Integrity={}",
-                hp.record.short_cite(),
-                hp.record.disc.code(),
-                hp.louvain_comm + 1,
-                hp.infomap_comm + 1,
-                hp.record.title,
-                hp.cb_undir * 100.0,
-                hp.v_exp,
-                hp.beauty_b,
-                hp.record.retraction.status.as_str()
-            );
+            Some((
+                format!(
+                    "{} [{} · L{} · M{}]\n{}\nCB_u={:.1}% · CD5={:+.2} · H={:.3} · A={:.3} · v_exp={:.2} · {}",
+                    hp.record.short_cite(),
+                    hp.record.disc.code(),
+                    hp.louvain_comm + 1,
+                    hp.infomap_comm + 1,
+                    hp.record.title,
+                    hp.cb_undir * 100.0,
+                    hp.disruption_cd5,
+                    hp.hits_hub,
+                    hp.hits_authority,
+                    hp.v_exp,
+                    hp.record.retraction.status.as_str()
+                ),
+                Color32::from_rgb(56, 189, 248),
+            ))
+        } else if let Some(any_i) = hovered_any_idx {
+            if any_i >= n && any_i < n + n_art_vis {
+                let art = &self.graph_viewer.artifact_nodes[any_i - n];
+                Some((
+                    format!(
+                        "[DataCite {}] {}\n{}\nRepo: {} · Downloads: {} · Linked Papers: {}",
+                        art.kind.as_str(),
+                        art.artifact_doi,
+                        art.title,
+                        art.repository,
+                        art.downloads,
+                        art.linked_paper_indices.len()
+                    ),
+                    Color32::from_rgb(45, 212, 191),
+                ))
+            } else if any_i >= n + n_art_vis && any_i < total_vis_nodes {
+                let bn = &self.graph_viewer.bio_entity_nodes[any_i - n - n_art_vis];
+                let [cr, cg, cb] = bn.kind.rgb();
+                Some((
+                    format!(
+                        "[{} · {}] {}\n{}\nMentions: {} · Linked Papers: {}",
+                        bn.kind.short_badge(),
+                        bn.provider,
+                        bn.entity_id,
+                        bn.label,
+                        bn.total_mentions,
+                        bn.linked_paper_indices.len()
+                    ),
+                    Color32::from_rgb(cr, cg, cb),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((tip_txt, border_col)) = tip_pair {
             let box_rect = Rect::from_min_size(
                 Pos2::new(rect.left() + 12.0, rect.top() + 12.0),
                 Vec2::new(430.0f32.min(rect.width() - 24.0), 58.0),
@@ -3047,7 +3612,7 @@ impl CitAtlasApp {
             painter.rect_stroke(
                 box_rect,
                 5.0,
-                Stroke::new(1.0, Color32::from_rgb(56, 189, 248)),
+                Stroke::new(1.0, border_col),
                 egui::StrokeKind::Inside,
             );
             painter.text(
@@ -3106,6 +3671,10 @@ impl CitAtlasApp {
                 Stroke::new(1.0, Color32::from_rgb(56, 189, 248)),
                 egui::StrokeKind::Inside,
             );
+        }
+
+        if self.graph_viewer.show_legend {
+            self.paint_network_canvas_legend(&painter, rect);
         }
     }
 
@@ -3288,9 +3857,17 @@ impl CitAtlasApp {
                                 ui.label("RW CSV:");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.rw_csv_path_input)
-                                        .desired_width(150.0)
+                                        .desired_width(115.0)
                                         .hint_text("retraction_watch.csv"),
                                 );
+                                if ui.small_button("Browse...").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .add_filter("Retraction Watch CSV", &["csv"])
+                                        .pick_file()
+                                    {
+                                        self.rw_csv_path_input = p.display().to_string();
+                                    }
+                                }
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Scholar cites=:");
@@ -3304,9 +3881,21 @@ impl CitAtlasApp {
                                 ui.label("Saved .html:");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.local_scholar_html_input)
-                                        .desired_width(145.0)
+                                        .desired_width(110.0)
                                         .hint_text("scholar_page1.html"),
                                 );
+                                if ui.small_button("Browse...").clicked() {
+                                    if let Some(files) = rfd::FileDialog::new()
+                                        .add_filter("Saved HTML", &["html", "htm"])
+                                        .pick_files()
+                                    {
+                                        self.local_scholar_html_input = files
+                                            .into_iter()
+                                            .map(|p| p.display().to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                    }
+                                }
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Polite Email:");
@@ -3453,23 +4042,32 @@ impl CitAtlasApp {
                                 self.apply_offline_instant_search(self.merge_search_results);
                             }
                             if ui.button("Export CSV / BibTeX").clicked() {
-                                let out_dir = PathBuf::from(self.download_dir.trim());
-                                let _ = std::fs::create_dir_all(&out_dir);
-                                let csv_p = out_dir.join("raw_harvest_catalog.csv");
-                                let bib_p = out_dir.join("corpus_references.bib");
-                                let csv_res = export_raw_papers_csv(&self.raw_papers, &csv_p);
-                                let bib_res = std::fs::write(&bib_p, format_bibtex_corpus(&self.raw_papers));
-                                match (csv_res, bib_res) {
-                                    (Ok(_), Ok(_)) => {
-                                        self.status_banner = format!(
-                                            "Exported {} works to {:?} and {:?}",
-                                            self.raw_papers.len(),
-                                            csv_p,
-                                            bib_p
-                                        );
+                                if let Some(out_dir) = rfd::FileDialog::new()
+                                    .set_title("Select Output Folder for Catalog CSV & BibTeX")
+                                    .pick_folder()
+                                {
+                                    self.download_dir = out_dir.display().to_string();
+                                    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                                        self.status_banner =
+                                            format!("Could not create export folder {:?}: {}", out_dir, e);
+                                    } else {
+                                        let csv_p = out_dir.join("raw_harvest_catalog.csv");
+                                        let bib_p = out_dir.join("corpus_references.bib");
+                                        let csv_res = export_raw_papers_csv(&self.raw_papers, &csv_p);
+                                        let bib_res = std::fs::write(&bib_p, format_bibtex_corpus(&self.raw_papers));
+                                        match (csv_res, bib_res) {
+                                            (Ok(_), Ok(_)) => {
+                                                self.status_banner = format!(
+                                                    "Exported {} works to {:?} and {:?}",
+                                                    self.raw_papers.len(),
+                                                    csv_p,
+                                                    bib_p
+                                                );
+                                            }
+                                            (Err(e), _) => self.status_banner = e,
+                                            (_, Err(e)) => self.status_banner = format!("BibTeX export failed: {}", e),
+                                        }
                                     }
-                                    (Err(e), _) => self.status_banner = e,
-                                    (_, Err(e)) => self.status_banner = format!("BibTeX export failed: {}", e),
                                 }
                             }
                         });
@@ -3509,7 +4107,15 @@ impl CitAtlasApp {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("PDF Dir:");
-                                ui.add(egui::TextEdit::singleline(&mut self.download_dir).desired_width(160.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.download_dir).desired_width(130.0));
+                                if ui.small_button("Browse...").clicked() {
+                                    if let Some(dir) = rfd::FileDialog::new()
+                                        .set_title("Select OA PDF Download Folder")
+                                        .pick_folder()
+                                    {
+                                        self.download_dir = dir.display().to_string();
+                                    }
+                                }
                                 if ui
                                     .add_enabled(
                                         !self.is_busy && !self.raw_papers.is_empty(),
@@ -3701,7 +4307,11 @@ impl CitAtlasApp {
 
         ui.add_space(4.0);
         ui.push_id("pop_results_scroll", |ui| {
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            let max_h = (ui.available_height() - 6.0).max(160.0);
+            egui::ScrollArea::both()
+                .max_height(max_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                 let col_btn = |ui: &mut egui::Ui, cur: PopSortColumn, asc: bool, target: PopSortColumn, name: &str| {
                     let label = if cur == target {
                         format!("{} {}", name, if asc { "[^]" } else { "[v]" })
@@ -3743,6 +4353,7 @@ impl CitAtlasApp {
                         }
                         ui.end_row();
 
+                        let mut next_focus: Option<String> = None;
                         for &(p_idx, cites, cpy, src_db) in &rows {
                             let p = &self.analytics.papers[p_idx];
                             let rec = &p.record;
@@ -3764,8 +4375,7 @@ impl CitAtlasApp {
                                 rec.title.clone()
                             };
                             if ui.selectable_label(is_sel, title_short).clicked() {
-                                self.focused_paper_id = rec.id.clone();
-                                self.show_dossier_panel = true;
+                                next_focus = Some(rec.id.clone());
                             }
 
                             ui.monospace(format!("{}", rec.year));
@@ -3791,7 +4401,11 @@ impl CitAtlasApp {
                             ui.monospace(doi_pdf);
                             ui.end_row();
                         }
+                        if let Some(fid) = next_focus {
+                            self.select_paper(fid);
+                        }
                     });
+                ui.add_space(6.0);
                 if let Some(col) = toggle_col {
                     self.toggle_pop_sort(col);
                 }
@@ -3850,7 +4464,11 @@ impl CitAtlasApp {
         rows.sort_by(|a, b| b.v_exp.partial_cmp(&a.v_exp).unwrap_or(std::cmp::Ordering::Equal));
 
         ui.push_id("velocity_ledger_scroll", |ui| {
-            egui::ScrollArea::both().show(ui, |ui| {
+            let max_h = (ui.available_height() - 6.0).max(160.0);
+            egui::ScrollArea::both()
+                .max_height(max_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                 egui::Grid::new("velocity_ledger_grid")
                     .striped(true)
                     .spacing([6.0, 4.0])
@@ -3886,8 +4504,7 @@ impl CitAtlasApp {
                                 p.record.title.clone()
                             };
                             if ui.link(short_title).on_hover_text(&p.record.title).clicked() {
-                                self.focused_paper_id = p.record.id.clone();
-                                self.show_dossier_panel = true;
+                                self.select_paper(p.record.id.clone());
                             }
                             ui.label(p.regime_tag);
                             ui.monospace(format!("{}", p.record.year));
@@ -3900,22 +4517,39 @@ impl CitAtlasApp {
                             ui.end_row();
                         }
                     });
+                ui.add_space(6.0);
             });
         });
     }
 
     fn paint_velocity_curves(&self, ui: &mut egui::Ui) {
-        let desired = Vec2::new(ui.available_width(), 240.0);
+        let desired = Vec2::new(ui.available_width(), 260.0);
         let (resp, painter) = ui.allocate_painter(desired, Sense::hover());
         let rect = resp.rect;
         painter.rect_filled(rect, 4.0, Color32::from_rgb(10, 15, 26));
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(30, 41, 59)),
+            egui::StrokeKind::Inside,
+        );
 
-        let pad_l = 40.0;
-        let pad_r = 18.0;
-        let pad_t = 16.0;
-        let pad_b = 24.0;
+        let pad_l = 48.0;
+        let pad_r = 16.0;
+        let pad_t = 34.0;
+        let pad_b = 26.0;
         let pw = (rect.width() - pad_l - pad_r).max(40.0);
         let ph = (rect.height() - pad_t - pad_b).max(40.0);
+        let plot_rect = Rect::from_min_size(
+            Pos2::new(rect.left() + pad_l, rect.top() + pad_t),
+            Vec2::new(pw, ph),
+        );
+        painter.rect_stroke(
+            plot_rect,
+            0.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
+            egui::StrokeKind::Inside,
+        );
 
         let selected: Vec<&crate::models::PaperMetrics> = self
             .compared_ids
@@ -3937,9 +4571,46 @@ impl CitAtlasApp {
                 .fold(1.5f64, f64::max) as f32
                 * 1.15;
 
+            let y_ticks = nice_linear_ticks(0.0, max_c, 4);
+            for &yt in &y_ticks {
+                if yt > max_c + 1e-4 {
+                    continue;
+                }
+                let py = plot_rect.bottom() - (yt / max_c) * ph;
+                painter.line_segment(
+                    [Pos2::new(plot_rect.left(), py), Pos2::new(plot_rect.right(), py)],
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 140)),
+                );
+                painter.text(
+                    Pos2::new(plot_rect.left() - 6.0, py),
+                    Align2::RIGHT_CENTER,
+                    format!("{:.0}", yt),
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(148, 163, 184),
+                );
+            }
+
+            let start_yr = focal.record.year;
+            let end_yr = focal.record.year + (age_len as i32) - 1;
+            for yr in nice_year_ticks(start_yr, end_yr, 6) {
+                let a = (yr - start_yr) as f32;
+                let px = plot_rect.left() + (a / ((age_len - 1).max(1) as f32)) * pw;
+                painter.line_segment(
+                    [Pos2::new(px, plot_rect.top()), Pos2::new(px, plot_rect.bottom())],
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 110)),
+                );
+                painter.text(
+                    Pos2::new(px, plot_rect.bottom() + 11.0),
+                    Align2::CENTER_CENTER,
+                    format!("{}", yr),
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(148, 163, 184),
+                );
+            }
+
             let bw = ((pw / (age_len as f32)) * 0.65).clamp(2.5, 12.0);
             for (a, &c_val) in focal.annual_counts.iter().enumerate() {
-                let x = rect.left() + pad_l + ((a as f32) / ((age_len - 1).max(1) as f32)) * pw;
+                let x = plot_rect.left() + ((a as f32) / ((age_len - 1).max(1) as f32)) * pw;
                 let bh = ((c_val as f32) / max_c) * ph;
                 let col = if focal.record.year + (a as i32) == focal.awaken_year {
                     Color32::from_rgb(244, 63, 94)
@@ -3948,8 +4619,8 @@ impl CitAtlasApp {
                 };
                 painter.rect_filled(
                     Rect::from_min_max(
-                        Pos2::new(x - bw * 0.5, rect.top() + pad_t + ph - bh),
-                        Pos2::new(x + bw * 0.5, rect.top() + pad_t + ph),
+                        Pos2::new(x - bw * 0.5, plot_rect.bottom() - bh),
+                        Pos2::new(x + bw * 0.5, plot_rect.bottom()),
                     ),
                     0.0,
                     col,
@@ -3959,29 +4630,27 @@ impl CitAtlasApp {
             if focal.peak_age_tm > 0 {
                 let mut ref_pts = Vec::new();
                 for a in 0..=focal.peak_age_tm {
-                    let x =
-                        rect.left() + pad_l + ((a as f32) / ((age_len - 1).max(1) as f32)) * pw;
-                    let y =
-                        rect.top() + pad_t + ph - ((focal.ke_ref_line[a] as f32) / max_c) * ph;
+                    let x = plot_rect.left() + ((a as f32) / ((age_len - 1).max(1) as f32)) * pw;
+                    let y = plot_rect.bottom() - ((focal.ke_ref_line[a] as f32) / max_c) * ph;
                     ref_pts.push(Pos2::new(x, y));
                 }
                 for pair in ref_pts.windows(2) {
                     painter.line_segment(
                         [pair[0], pair[1]],
-                        Stroke::new(2.0, Color32::from_rgb(250, 204, 21)),
+                        Stroke::new(2.0_f32, Color32::from_rgb(250, 204, 21)),
                     );
                 }
             }
             painter.text(
-                Pos2::new(rect.left() + pad_l + 6.0, rect.top() + 14.0),
+                Pos2::new(plot_rect.left() + 4.0, rect.top() + 12.0),
                 Align2::LEFT_CENTER,
                 format!(
-                    "{} — B = {:.1}, Awakening t_a = {}",
+                    "{} — B={:.1}, t_a={}  |  Blue: c_t   Rose: t_a   Gold: l_t",
                     focal.record.short_cite(),
                     focal.beauty_b,
                     focal.awaken_year
                 ),
-                FontId::monospace(11.0),
+                FontId::monospace(10.2),
                 Color32::from_rgb(250, 204, 21),
             );
             return;
@@ -4010,9 +4679,86 @@ impl CitAtlasApp {
                 max_v = max_v.max(val as f32);
             }
         }
+        if min_v < 0.0 {
+            min_v *= 1.12;
+        }
         max_v *= 1.12;
         let span_v = (max_v - min_v).max(1e-5);
         let y_span = self.analytics.year_span.max(2);
+        let min_yr = self.analytics.min_year;
+        let max_yr = min_yr + (y_span as i32) - 1;
+
+        for yt in nice_linear_ticks(min_v, max_v, 5) {
+            if yt < min_v - 1e-4 || yt > max_v + 1e-4 {
+                continue;
+            }
+            let py = plot_rect.bottom() - ((yt - min_v) / span_v) * ph;
+            let is_zero = yt.abs() < 1e-4 && min_v < 0.0;
+            painter.line_segment(
+                [Pos2::new(plot_rect.left(), py), Pos2::new(plot_rect.right(), py)],
+                Stroke::new(
+                    if is_zero { 1.1_f32 } else { 0.6_f32 },
+                    if is_zero {
+                        Color32::from_rgb(100, 116, 139)
+                    } else {
+                        Color32::from_rgba_unmultiplied(51, 65, 85, 135)
+                    },
+                ),
+            );
+            let lbl = if span_v >= 10.0 {
+                format!("{:.0}", yt)
+            } else {
+                format!("{:.2}", yt)
+            };
+            painter.text(
+                Pos2::new(plot_rect.left() - 6.0, py),
+                Align2::RIGHT_CENTER,
+                lbl,
+                FontId::monospace(9.5),
+                Color32::from_rgb(148, 163, 184),
+            );
+        }
+
+        for yr in nice_year_ticks(min_yr, max_yr, 6) {
+            let y_idx = (yr - min_yr) as f32;
+            let px = plot_rect.left() + (y_idx / ((y_span - 1) as f32)) * pw;
+            painter.line_segment(
+                [Pos2::new(px, plot_rect.top()), Pos2::new(px, plot_rect.bottom())],
+                Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 110)),
+            );
+            painter.text(
+                Pos2::new(px, plot_rect.bottom() + 11.0),
+                Align2::CENTER_CENTER,
+                format!("{}", yr),
+                FontId::monospace(9.5),
+                Color32::from_rgb(148, 163, 184),
+            );
+        }
+
+        // Top-strip multi-curve legend (color swatch + short_cite)
+        let mut leg_x = plot_rect.left() + 4.0;
+        let mut leg_y = rect.top() + 11.0;
+        for (s_idx, p) in selected.iter().enumerate() {
+            let col = colors[s_idx % colors.len()];
+            let lbl = p.record.short_cite();
+            let item_w = 18.0 + (lbl.chars().count() as f32) * 5.8 + 10.0;
+            if leg_x + item_w > rect.right() - 8.0 && leg_x > plot_rect.left() + 10.0 {
+                leg_x = plot_rect.left() + 4.0;
+                leg_y += 12.0;
+            }
+            painter.line_segment(
+                [Pos2::new(leg_x, leg_y), Pos2::new(leg_x + 14.0, leg_y)],
+                Stroke::new(2.4_f32, col),
+            );
+            painter.text(
+                Pos2::new(leg_x + 17.0, leg_y),
+                Align2::LEFT_CENTER,
+                lbl,
+                FontId::monospace(9.5),
+                Color32::from_rgb(226, 232, 240),
+            );
+            leg_x += item_w;
+        }
 
         for (s_idx, p) in selected.iter().enumerate() {
             let col = colors[s_idx % colors.len()];
@@ -4029,96 +4775,371 @@ impl CitAtlasApp {
                 if yr < p.record.year {
                     continue;
                 }
-                let x = rect.left() + pad_l + ((y_idx as f32) / ((y_span - 1) as f32)) * pw;
-                let y = rect.top() + pad_t + ph - (((val as f32) - min_v) / span_v) * ph;
+                let x = plot_rect.left() + ((y_idx as f32) / ((y_span - 1) as f32)) * pw;
+                let y = plot_rect.bottom() - (((val as f32) - min_v) / span_v) * ph;
                 pts.push(Pos2::new(x, y));
             }
             for pair in pts.windows(2) {
-                painter.line_segment([pair[0], pair[1]], Stroke::new(2.0, col));
+                painter.line_segment([pair[0], pair[1]], Stroke::new(2.0_f32, col));
             }
         }
     }
 
     fn paint_velocity_phase(&mut self, ui: &mut egui::Ui) {
-        let desired = Vec2::new(ui.available_width(), 240.0);
+        let desired = Vec2::new(ui.available_width(), 260.0);
         let (resp, painter) = ui.allocate_painter(desired, Sense::click());
         let rect = resp.rect;
         painter.rect_filled(rect, 4.0, Color32::from_rgb(10, 15, 26));
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(30, 41, 59)),
+            egui::StrokeKind::Inside,
+        );
 
-        let pad_l = 40.0;
-        let pad_r = 18.0;
-        let pad_t = 16.0;
-        let pad_b = 24.0;
+        let pad_l = 50.0;
+        let pad_r = 16.0;
+        let pad_t = 24.0;
+        let pad_b = 26.0;
         let pw = (rect.width() - pad_l - pad_r).max(40.0);
         let ph = (rect.height() - pad_t - pad_b).max(40.0);
+        let plot_rect = Rect::from_min_size(
+            Pos2::new(rect.left() + pad_l, rect.top() + pad_t),
+            Vec2::new(pw, ph),
+        );
+        painter.rect_stroke(
+            plot_rect,
+            0.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
+            egui::StrokeKind::Inside,
+        );
 
         let click_pos = if resp.clicked() {
             resp.interact_pointer_pos()
         } else {
             None
         };
+        let hover_pos = resp.hover_pos();
+        let mut hovered_tip: Option<(Pos2, String)> = None;
+        let mut next_focus: Option<String> = None;
 
         if self.show_awakening_quadrant {
-            let max_x = self
+            let x_vals: Vec<f32> = self
                 .analytics
                 .papers
                 .iter()
-                .map(|p| p.hibernation_years as f32)
-                .fold(5.0f32, f32::max)
-                * 1.1;
-            let max_y = self
+                .map(|p| (p.hibernation_years.max(0)) as f32)
+                .collect();
+            let y_vals: Vec<f32> = self
                 .analytics
                 .papers
                 .iter()
                 .map(|p| p.beauty_b as f32)
-                .fold(5.0f32, f32::max)
-                * 1.1;
+                .collect();
+            let (max_x, _) = compute_robust_upper_bound(&x_vals, 8.0);
+            let (max_y, _) = compute_robust_upper_bound(&y_vals, 14.0);
 
-            for p in &self.analytics.papers {
-                let cx = rect.left() + pad_l + ((p.hibernation_years as f32) / max_x) * pw;
-                let cy = rect.top() + pad_t + ph - ((p.beauty_b as f32) / max_y) * ph;
-                let center = Pos2::new(cx, cy);
-                let [r, g, b] = p.record.disc.rgb();
-                painter.circle_filled(center, 5.2, Color32::from_rgb(r, g, b));
-                if let Some(cp) = click_pos {
-                    if cp.distance(center) <= 8.0 {
-                        self.focused_paper_id = p.record.id.clone();
-                    }
+            for xt in nice_linear_ticks(0.0, max_x, 5) {
+                if xt > max_x + 1e-4 {
+                    continue;
                 }
+                let px = plot_rect.left() + (xt / max_x) * pw;
+                painter.line_segment(
+                    [Pos2::new(px, plot_rect.top()), Pos2::new(px, plot_rect.bottom())],
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 110)),
+                );
+                painter.text(
+                    Pos2::new(px, plot_rect.bottom() + 11.0),
+                    Align2::CENTER_CENTER,
+                    format!("{:.0}y", xt),
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(148, 163, 184),
+                );
             }
-        } else {
-            let max_x = self
-                .analytics
-                .papers
-                .iter()
-                .map(|p| p.v_exp as f32)
-                .fold(0.5f32, f32::max)
-                * 1.12;
-            let abs_y = self
-                .analytics
-                .papers
-                .iter()
-                .map(|p| (p.accel as f32).abs())
-                .fold(0.15f32, f32::max)
-                * 1.2;
-            let zero_y = rect.top() + pad_t + ph * 0.5;
+            for yt in nice_linear_ticks(0.0, max_y, 5) {
+                if yt > max_y + 1e-4 {
+                    continue;
+                }
+                let py = plot_rect.bottom() - (yt / max_y) * ph;
+                painter.line_segment(
+                    [Pos2::new(plot_rect.left(), py), Pos2::new(plot_rect.right(), py)],
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 110)),
+                );
+                painter.text(
+                    Pos2::new(plot_rect.left() - 6.0, py),
+                    Align2::RIGHT_CENTER,
+                    format!("{:.0}", yt),
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(148, 163, 184),
+                );
+            }
+
+            let ref_x = 5.0f32.min(max_x * 0.85);
+            let ref_y = 12.0f32.min(max_y * 0.85);
+            let rx_px = plot_rect.left() + (ref_x / max_x) * pw;
+            let ry_px = plot_rect.bottom() - (ref_y / max_y) * ph;
             painter.line_segment(
-                [Pos2::new(rect.left() + pad_l, zero_y), Pos2::new(rect.right() - pad_r, zero_y)],
-                Stroke::new(1.0, Color32::from_rgb(71, 85, 105)),
+                [Pos2::new(rx_px, plot_rect.top()), Pos2::new(rx_px, plot_rect.bottom())],
+                Stroke::new(1.0_f32, Color32::from_rgb(71, 85, 105)),
+            );
+            painter.line_segment(
+                [Pos2::new(plot_rect.left(), ry_px), Pos2::new(plot_rect.right(), ry_px)],
+                Stroke::new(1.0_f32, Color32::from_rgb(71, 85, 105)),
             );
 
+            let q_col = Color32::from_rgba_unmultiplied(148, 163, 184, 185);
+            painter.text(Pos2::new(plot_rect.right() - 6.0, plot_rect.top() + 8.0), Align2::RIGHT_TOP, "Sleeping Beauties", FontId::proportional(9.8), q_col);
+            painter.text(Pos2::new(plot_rect.left() + 6.0, plot_rect.top() + 8.0), Align2::LEFT_TOP, "Rapid-Burst Classics", FontId::proportional(9.8), q_col);
+            painter.text(Pos2::new(plot_rect.right() - 6.0, plot_rect.bottom() - 6.0), Align2::RIGHT_BOTTOM, "Late Bloomers", FontId::proportional(9.8), q_col);
+            painter.text(Pos2::new(plot_rect.left() + 6.0, plot_rect.bottom() - 6.0), Align2::LEFT_BOTTOM, "Steady Core", FontId::proportional(9.8), q_col);
+
+            let mut outlier_count = 0usize;
             for p in &self.analytics.papers {
-                let cx = rect.left() + pad_l + ((p.v_exp as f32) / max_x) * pw;
-                let cy = zero_y - ((p.accel as f32) / abs_y) * (ph * 0.5);
+                let vx = (p.hibernation_years.max(0)) as f32;
+                let vy = p.beauty_b as f32;
+                let clipped = vx > max_x || vy > max_y;
+                if clipped {
+                    outlier_count += 1;
+                }
+                let cx = plot_rect.left() + (vx.min(max_x) / max_x) * pw;
+                let cy = plot_rect.bottom() - (vy.min(max_y) / max_y) * ph;
                 let center = Pos2::new(cx, cy);
                 let [r, g, b] = p.record.disc.rgb();
-                painter.circle_filled(center, 5.2, Color32::from_rgb(r, g, b));
+                let col = Color32::from_rgb(r, g, b);
+                if clipped {
+                    let d = 5.5_f32;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            Pos2::new(center.x, center.y - d),
+                            Pos2::new(center.x + d, center.y),
+                            Pos2::new(center.x, center.y + d),
+                            Pos2::new(center.x - d, center.y),
+                        ],
+                        Color32::from_rgba_unmultiplied(r, g, b, 175),
+                        Stroke::new(1.2_f32, Color32::from_rgb(250, 204, 21)),
+                    ));
+                    if outlier_count <= 2 {
+                        let tx = (center.x - 6.0).clamp(plot_rect.left() + 55.0, plot_rect.right() - 6.0);
+                        let ty = (center.y + 10.0).clamp(plot_rect.top() + 18.0, plot_rect.bottom() - 16.0);
+                        painter.text(
+                            Pos2::new(tx, ty),
+                            Align2::RIGHT_CENTER,
+                            format!("{} (B={:.0})", p.record.short_cite(), p.beauty_b),
+                            FontId::monospace(9.0),
+                            Color32::from_rgb(250, 204, 21),
+                        );
+                    }
+                } else {
+                    painter.circle_filled(center, 4.8, col);
+                }
+                if p.record.id == self.focused_paper_id {
+                    painter.circle_stroke(center, 6.8, Stroke::new(1.8_f32, Color32::WHITE));
+                }
                 if let Some(cp) = click_pos {
-                    if cp.distance(center) <= 8.0 {
-                        self.focused_paper_id = p.record.id.clone();
+                    if cp.distance(center) <= 8.5 {
+                        next_focus = Some(p.record.id.clone());
+                    }
+                }
+                if let Some(hp) = hover_pos {
+                    if hp.distance(center) <= 9.0 {
+                        hovered_tip = Some((
+                            center,
+                            format!(
+                                "{} ({})\nLag={}y · Beauty B={:.1} · t_a={}",
+                                p.record.short_cite(),
+                                p.record.disc.code(),
+                                p.hibernation_years,
+                                p.beauty_b,
+                                p.awaken_year
+                            ),
+                        ));
                     }
                 }
             }
+            painter.text(
+                Pos2::new(plot_rect.left() + 4.0, rect.top() + 11.0),
+                Align2::LEFT_CENTER,
+                "X: Hibernation Lag (yr)   Y: Ke Beauty B",
+                FontId::monospace(9.5),
+                Color32::from_rgb(148, 163, 184),
+            );
+            if outlier_count > 0 {
+                painter.text(
+                    Pos2::new(plot_rect.right() - 2.0, rect.top() + 11.0),
+                    Align2::RIGHT_CENTER,
+                    format!("Clipped outliers: {}", outlier_count),
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(250, 204, 21),
+                );
+            }
+        } else {
+            let v_vals: Vec<f32> = self.analytics.papers.iter().map(|p| p.v_exp as f32).collect();
+            let a_vals: Vec<f32> = self.analytics.papers.iter().map(|p| p.accel as f32).collect();
+            let (max_x, _) = compute_robust_upper_bound(&v_vals, 0.5);
+            let (abs_y, _) = compute_robust_symmetric_bound(&a_vals, 0.18);
+
+            let med_v = {
+                let mut s = v_vals.clone();
+                s.sort_by(|a, b| a.total_cmp(b));
+                if s.is_empty() { 0.25 } else { s[s.len() / 2].clamp(0.05, max_x * 0.9) }
+            };
+
+            for xt in nice_linear_ticks(0.0, max_x, 5) {
+                if xt > max_x + 1e-4 {
+                    continue;
+                }
+                let px = plot_rect.left() + (xt / max_x) * pw;
+                painter.line_segment(
+                    [Pos2::new(px, plot_rect.top()), Pos2::new(px, plot_rect.bottom())],
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 110)),
+                );
+                painter.text(
+                    Pos2::new(px, plot_rect.bottom() + 11.0),
+                    Align2::CENTER_CENTER,
+                    format!("{:.2}", xt),
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(148, 163, 184),
+                );
+            }
+            for yt in nice_linear_ticks(-abs_y, abs_y, 5) {
+                if yt < -abs_y - 1e-4 || yt > abs_y + 1e-4 {
+                    continue;
+                }
+                let py = plot_rect.center().y - (yt / abs_y) * (ph * 0.5);
+                painter.line_segment(
+                    [Pos2::new(plot_rect.left(), py), Pos2::new(plot_rect.right(), py)],
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 110)),
+                );
+                painter.text(
+                    Pos2::new(plot_rect.left() - 6.0, py),
+                    Align2::RIGHT_CENTER,
+                    format!("{:+.2}", yt),
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(148, 163, 184),
+                );
+            }
+
+            let zero_y = plot_rect.center().y;
+            let med_x = plot_rect.left() + (med_v / max_x) * pw;
+            painter.line_segment(
+                [Pos2::new(plot_rect.left(), zero_y), Pos2::new(plot_rect.right(), zero_y)],
+                Stroke::new(1.1_f32, Color32::from_rgb(71, 85, 105)),
+            );
+            painter.line_segment(
+                [Pos2::new(med_x, plot_rect.top()), Pos2::new(med_x, plot_rect.bottom())],
+                Stroke::new(1.0_f32, Color32::from_rgb(71, 85, 105)),
+            );
+
+            let q_col = Color32::from_rgba_unmultiplied(148, 163, 184, 185);
+            painter.text(Pos2::new(plot_rect.right() - 6.0, plot_rect.top() + 8.0), Align2::RIGHT_TOP, "Accelerating Leaders", FontId::proportional(9.8), q_col);
+            painter.text(Pos2::new(plot_rect.left() + 6.0, plot_rect.top() + 8.0), Align2::LEFT_TOP, "Emerging Risers", FontId::proportional(9.8), q_col);
+            painter.text(Pos2::new(plot_rect.right() - 6.0, plot_rect.bottom() - 6.0), Align2::RIGHT_BOTTOM, "Maturing / Cooling", FontId::proportional(9.8), q_col);
+            painter.text(Pos2::new(plot_rect.left() + 6.0, plot_rect.bottom() - 6.0), Align2::LEFT_BOTTOM, "Dormant / Decaying", FontId::proportional(9.8), q_col);
+
+            let mut outlier_count = 0usize;
+            for p in &self.analytics.papers {
+                let vx = p.v_exp as f32;
+                let vy = p.accel as f32;
+                let clipped = vx > max_x || vy.abs() > abs_y;
+                if clipped {
+                    outlier_count += 1;
+                }
+                let cx = plot_rect.left() + (vx.clamp(0.0, max_x) / max_x) * pw;
+                let cy = zero_y - (vy.clamp(-abs_y, abs_y) / abs_y) * (ph * 0.5);
+                let center = Pos2::new(cx, cy);
+                let [r, g, b] = p.record.disc.rgb();
+                let col = Color32::from_rgb(r, g, b);
+                if clipped {
+                    let d = 5.5_f32;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            Pos2::new(center.x, center.y - d),
+                            Pos2::new(center.x + d, center.y),
+                            Pos2::new(center.x, center.y + d),
+                            Pos2::new(center.x - d, center.y),
+                        ],
+                        Color32::from_rgba_unmultiplied(r, g, b, 180),
+                        Stroke::new(1.2_f32, Color32::from_rgb(250, 204, 21)),
+                    ));
+                    if outlier_count <= 2 {
+                        let tx = (center.x + 8.0).clamp(plot_rect.left() + 10.0, plot_rect.right() - 95.0);
+                        let ty = (center.y - 10.0).clamp(plot_rect.top() + 18.0, plot_rect.bottom() - 16.0);
+                        painter.text(
+                            Pos2::new(tx, ty),
+                            Align2::LEFT_CENTER,
+                            format!("{} ({:+.2})", p.record.short_cite(), p.accel),
+                            FontId::monospace(9.0),
+                            Color32::from_rgb(250, 204, 21),
+                        );
+                    }
+                } else {
+                    painter.circle_filled(center, 4.8, col);
+                }
+                if p.record.id == self.focused_paper_id {
+                    painter.circle_stroke(center, 6.8, Stroke::new(1.8_f32, Color32::WHITE));
+                }
+                if let Some(cp) = click_pos {
+                    if cp.distance(center) <= 8.5 {
+                        next_focus = Some(p.record.id.clone());
+                    }
+                }
+                if let Some(hp) = hover_pos {
+                    if hp.distance(center) <= 9.0 {
+                        hovered_tip = Some((
+                            center,
+                            format!(
+                                "{} ({})\nv_exp={:.2} · dv/dt={:+.2} · CD5={:+.2}",
+                                p.record.short_cite(),
+                                p.record.disc.code(),
+                                p.v_exp,
+                                p.accel,
+                                p.disruption_cd5
+                            ),
+                        ));
+                    }
+                }
+            }
+            painter.text(
+                Pos2::new(plot_rect.left() + 4.0, rect.top() + 11.0),
+                Align2::LEFT_CENTER,
+                format!("X: v_exp (med={:.2})   Y: dv/dt", med_v),
+                FontId::monospace(9.5),
+                Color32::from_rgb(148, 163, 184),
+            );
+            if outlier_count > 0 {
+                painter.text(
+                    Pos2::new(plot_rect.right() - 2.0, rect.top() + 11.0),
+                    Align2::RIGHT_CENTER,
+                    format!("Clipped outliers: {}", outlier_count),
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(250, 204, 21),
+                );
+            }
+        }
+
+        if let Some((pt, tip)) = hovered_tip {
+            let box_w = 235.0_f32.min(pw - 8.0);
+            let box_x = (pt.x + 10.0).min(plot_rect.right() - box_w - 4.0).max(plot_rect.left() + 4.0);
+            let box_y = (pt.y - 38.0).max(plot_rect.top() + 4.0);
+            let tip_rect = Rect::from_min_size(Pos2::new(box_x, box_y), Vec2::new(box_w, 34.0));
+            painter.rect_filled(tip_rect, 4.0, Color32::from_rgba_unmultiplied(15, 23, 42, 236));
+            painter.rect_stroke(
+                tip_rect,
+                4.0,
+                Stroke::new(1.0_f32, Color32::from_rgb(56, 189, 248)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                Pos2::new(tip_rect.left() + 6.0, tip_rect.center().y),
+                Align2::LEFT_CENTER,
+                tip,
+                FontId::monospace(9.4),
+                Color32::from_rgb(241, 245, 249),
+            );
+        }
+
+        if let Some(fid) = next_focus {
+            self.select_paper(fid);
         }
     }
 
@@ -4330,6 +5351,7 @@ impl CitAtlasApp {
             None
         };
 
+        let mut next_focus: Option<String> = None;
         for p in &self.analytics.papers {
             let Some(&np) = self.node_positions.get(&p.record.id) else {
                 continue;
@@ -4365,10 +5387,12 @@ impl CitAtlasApp {
             }
             if let Some(cp) = click_pos {
                 if cp.distance(sc) <= rad + 4.0 {
-                    self.focused_paper_id = p.record.id.clone();
-                    self.show_dossier_panel = true;
+                    next_focus = Some(p.record.id.clone());
                 }
             }
+        }
+        if let Some(fid) = next_focus {
+            self.select_paper(fid);
         }
     }
 
@@ -4421,6 +5445,7 @@ impl CitAtlasApp {
             None
         };
 
+        let mut next_focus: Option<String> = None;
         for p in &self.analytics.papers {
             let (px_val, pz_val, [r, g, b]) = match self.partition_scheme {
                 PartitionScheme::FixedDiscipline => (p.part_p, p.within_z, p.record.disc.rgb()),
@@ -4440,10 +5465,12 @@ impl CitAtlasApp {
             painter.circle_filled(center, rad, Color32::from_rgb(r, g, b));
             if let Some(cp) = click_pos {
                 if cp.distance(center) <= rad + 4.0 {
-                    self.focused_paper_id = p.record.id.clone();
-                    self.show_dossier_panel = true;
+                    next_focus = Some(p.record.id.clone());
                 }
             }
+        }
+        if let Some(fid) = next_focus {
+            self.select_paper(fid);
         }
     }
 
@@ -4696,8 +5723,7 @@ impl CitAtlasApp {
         });
 
         if let Some(fid) = next_focus {
-            self.focused_paper_id = fid;
-            self.show_dossier_panel = true;
+            self.select_paper(fid);
         }
     }
 
@@ -5072,7 +6098,24 @@ impl CitAtlasApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("SQLite DB Path:");
-                    ui.add(egui::TextEdit::singleline(&mut self.db_path_input).desired_width(200.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.db_path_input).desired_width(165.0));
+                    if ui.small_button("Browse...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("SQLite Ledger", &["db", "sqlite", "sqlite3"])
+                            .pick_file()
+                        {
+                            self.db_path_input = p.display().to_string();
+                        }
+                    }
+                    if ui.small_button("Save As...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("SQLite Ledger", &["db", "sqlite", "sqlite3"])
+                            .set_file_name("cit_atlas_ledger.db")
+                            .save_file()
+                        {
+                            self.db_path_input = p.display().to_string();
+                        }
+                    }
                 });
 
                 ui.horizontal_wrapped(|ui| {
@@ -5114,13 +6157,24 @@ impl CitAtlasApp {
                 });
 
                 ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Import .csv/.bib/.json/.graphml/.gexf:");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Import Corpus File:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.import_path_input)
-                            .desired_width(185.0)
-                            .hint_text("papers.csv, scholar.html, refs.bib"),
+                            .desired_width(165.0)
+                            .hint_text("refs.ris, pubmed.nbib, csl.json, refs.bib, papers.csv"),
                     );
+                    if ui.small_button("Browse...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter(
+                                "Bibliographic Corpus",
+                                &["csv", "bib", "bibtex", "ris", "nbib", "medline", "json", "csl", "csljson", "graphml", "gexf", "html", "htm", "txt"],
+                            )
+                            .pick_file()
+                        {
+                            self.import_path_input = p.display().to_string();
+                        }
+                    }
                     if ui.button("Import File").clicked() {
                         match import_corpus_file(std::path::Path::new(self.import_path_input.trim())) {
                             Ok((p, e)) => {
@@ -5128,7 +6182,7 @@ impl CitAtlasApp {
                                 self.raw_edges = e;
                                 self.corpus_label = format!("Imported ({})", self.import_path_input);
                                 self.recompute_all();
-                                self.status_banner = "Imported external corpus file (.csv/.bib/.json/.html).".to_string();
+                                self.status_banner = "Imported external corpus file (.csv/.bib/.ris/.nbib/.json/.html).".to_string();
                             }
                             Err(err) => self.status_banner = err,
                         }
@@ -5137,9 +6191,17 @@ impl CitAtlasApp {
 
                 ui.separator();
                 ui.label(RichText::new("RFC 4180 Multi-Table CSV Export Suite & Bundles").strong());
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("CSV Suite Folder:");
-                    ui.add(egui::TextEdit::singleline(&mut self.csv_export_dir_input).desired_width(180.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.csv_export_dir_input).desired_width(145.0));
+                    if ui.small_button("Browse...").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Select CSV Export Suite Folder")
+                            .pick_folder()
+                        {
+                            self.csv_export_dir_input = dir.display().to_string();
+                        }
+                    }
                     if ui
                         .button(RichText::new("Export All 10 CSV Tables").strong())
                         .clicked()
@@ -5161,118 +6223,188 @@ impl CitAtlasApp {
 
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Papers Metrics CSV").clicked() {
-                        let p = std::path::Path::new("papers_metrics.csv");
-                        match export_metrics_csv(&self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported papers_metrics.csv (53 columns incl. Retractions & DataCite)".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("papers_metrics.csv")
+                            .save_file()
+                        {
+                            match export_metrics_csv(&self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {} (63 columns incl. CD5, HITS, Retractions & DataCite)", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Bridges & Retractions CSV").clicked() {
-                        let p = std::path::Path::new("artifact_and_retraction_bridges.csv");
-                        match export_integrity_and_datacite_csv(&self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported artifact_and_retraction_bridges.csv".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("artifact_and_retraction_bridges.csv")
+                            .save_file()
+                        {
+                            match export_integrity_and_datacite_csv(&self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Bio-Entity Bridges CSV").clicked() {
-                        let p = std::path::Path::new("epmc_uniprot_pdb_bridges.csv");
-                        match export_bio_entity_bridges_csv(&self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported epmc_uniprot_pdb_bridges.csv (Europe PMC + UniProt + PDB)".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("epmc_uniprot_pdb_bridges.csv")
+                            .save_file()
+                        {
+                            match export_bio_entity_bridges_csv(&self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {} (Europe PMC + UniProt + PDB)", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Crawl Audit CSV").clicked() {
-                        let p = std::path::Path::new("crawl_telemetry_audit.csv");
-                        let rows = snapshot_global_audit_log();
-                        match export_crawl_audit_csv(&rows, p) {
-                            Ok(_) => self.status_banner = format!("Exported crawl_telemetry_audit.csv ({} entries)", rows.len()),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("crawl_telemetry_audit.csv")
+                            .save_file()
+                        {
+                            let rows = snapshot_global_audit_log();
+                            match export_crawl_audit_csv(&rows, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {} ({} entries)", p.display(), rows.len()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Raw Catalog CSV").clicked() {
-                        let p = std::path::Path::new("raw_harvest_catalog.csv");
-                        match export_raw_papers_csv(&self.raw_papers, p) {
-                            Ok(_) => self.status_banner = "Exported raw_harvest_catalog.csv".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("raw_harvest_catalog.csv")
+                            .save_file()
+                        {
+                            match export_raw_papers_csv(&self.raw_papers, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Citation Edges CSV").clicked() {
-                        let p = std::path::Path::new("citation_edges.csv");
-                        match export_edges_csv(&self.raw_papers, &self.raw_edges, &self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported citation_edges.csv".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("citation_edges.csv")
+                            .save_file()
+                        {
+                            match export_edges_csv(&self.raw_papers, &self.raw_edges, &self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Annual Curves CSV").clicked() {
-                        let p = std::path::Path::new("annual_trajectories.csv");
-                        match export_annual_trajectories_csv(&self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported annual_trajectories.csv".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("annual_trajectories.csv")
+                            .save_file()
+                        {
+                            match export_annual_trajectories_csv(&self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Topic Drift CSV").clicked() {
-                        let p = std::path::Path::new("topic_drift_windows.csv");
-                        match export_topic_drift_csv(&self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported topic_drift_windows.csv".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("topic_drift_windows.csv")
+                            .save_file()
+                        {
+                            match export_topic_drift_csv(&self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("JSD Matrix CSV").clicked() {
-                        let p = std::path::Path::new("pairwise_jsd_matrix.csv");
-                        match export_jsd_matrix_csv(&self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported pairwise_jsd_matrix.csv".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("pairwise_jsd_matrix.csv")
+                            .save_file()
+                        {
+                            match export_jsd_matrix_csv(&self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Communities CSV").clicked() {
-                        let p = std::path::Path::new("communities_summary.csv");
-                        match export_communities_csv(&self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported communities_summary.csv".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("communities_summary.csv")
+                            .save_file()
+                        {
+                            match export_communities_csv(&self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Export GraphML (.graphml)").clicked() {
-                        let p = std::path::Path::new("cit_atlas_network.graphml");
-                        match export_graphml(
-                            &self.raw_papers,
-                            &self.raw_edges,
-                            &self.analytics,
-                            Some(&self.graph_viewer.positions),
-                            self.graph_viewer.color_by,
-                            self.graph_viewer.show_datacite_diamonds || self.graph_viewer.show_bio_entity_nodes,
-                            p,
-                        ) {
-                            Ok(_) => self.status_banner = "Exported cit_atlas_network.graphml (with layout & attributes)".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("GraphML Network", &["graphml"])
+                            .set_file_name("cit_atlas_network.graphml")
+                            .save_file()
+                        {
+                            match export_graphml(
+                                &self.raw_papers,
+                                &self.raw_edges,
+                                &self.analytics,
+                                Some(&self.graph_viewer.positions),
+                                self.graph_viewer.color_by,
+                                self.graph_viewer.show_datacite_diamonds || self.graph_viewer.show_bio_entity_nodes,
+                                &p,
+                            ) {
+                                Ok(_) => self.status_banner = format!("Exported {} (with layout & attributes)", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Export GEXF 1.3 (.gexf)").clicked() {
-                        let p = std::path::Path::new("cit_atlas_network.gexf");
-                        match export_gexf(
-                            &self.raw_papers,
-                            &self.raw_edges,
-                            &self.analytics,
-                            Some(&self.graph_viewer.positions),
-                            self.graph_viewer.color_by,
-                            self.graph_viewer.show_datacite_diamonds || self.graph_viewer.show_bio_entity_nodes,
-                            p,
-                        ) {
-                            Ok(_) => self.status_banner = "Exported cit_atlas_network.gexf (Gephi 1.3 viz colors & coords)".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Gephi GEXF 1.3", &["gexf"])
+                            .set_file_name("cit_atlas_network.gexf")
+                            .save_file()
+                        {
+                            match export_gexf(
+                                &self.raw_papers,
+                                &self.raw_edges,
+                                &self.analytics,
+                                Some(&self.graph_viewer.positions),
+                                self.graph_viewer.color_by,
+                                self.graph_viewer.show_datacite_diamonds || self.graph_viewer.show_bio_entity_nodes,
+                                &p,
+                            ) {
+                                Ok(_) => self.status_banner = format!("Exported {} (Gephi 1.3 viz colors & coords)", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Graph JSON").clicked() {
-                        let p = std::path::Path::new("cit_atlas_bundle.json");
-                        match export_bundle_json(&self.raw_papers, &self.raw_edges, &self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported cit_atlas_bundle.json".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("JSON Bundle", &["json"])
+                            .set_file_name("cit_atlas_bundle.json")
+                            .save_file()
+                        {
+                            match export_bundle_json(&self.raw_papers, &self.raw_edges, &self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                     if ui.button("Synthesis SVG").clicked() {
-                        let p = std::path::Path::new("cit_atlas_synthesis.svg");
-                        match export_synthesis_svg(&self.analytics, p) {
-                            Ok(_) => self.status_banner = "Exported cit_atlas_synthesis.svg".to_string(),
-                            Err(e) => self.status_banner = e,
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("SVG Vector", &["svg"])
+                            .set_file_name("cit_atlas_synthesis.svg")
+                            .save_file()
+                        {
+                            match export_synthesis_svg(&self.analytics, &p) {
+                                Ok(_) => self.status_banner = format!("Exported {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
                         }
                     }
                 });
@@ -5460,60 +6592,84 @@ impl CitAtlasApp {
                 self.status_banner = "Cleared in-memory crawl telemetry audit log.".to_string();
             }
             if ui.button("Save Policies & Audit to SQLite").clicked() {
-                let pols = snapshot_global_policies();
-                let logs = snapshot_global_audit_log();
-                match LedgerStore::open(std::path::Path::new(&self.db_path_input))
-                    .and_then(|mut s| s.save_rate_policies_and_audit(&pols, &logs))
+                if let Some(db_p) = rfd::FileDialog::new()
+                    .add_filter("SQLite Ledger", &["db", "sqlite", "sqlite3"])
+                    .set_file_name("cit_atlas_ledger.db")
+                    .save_file()
                 {
-                    Ok(_) => {
-                        self.status_banner = format!(
-                            "Saved {} domain policies and {} audit entries to {}",
-                            pols.len(),
-                            logs.len(),
-                            self.db_path_input
-                        );
+                    self.db_path_input = db_p.display().to_string();
+                    let pols = snapshot_global_policies();
+                    let logs = snapshot_global_audit_log();
+                    match LedgerStore::open(&db_p)
+                        .and_then(|mut s| s.save_rate_policies_and_audit(&pols, &logs))
+                    {
+                        Ok(_) => {
+                            self.status_banner = format!(
+                                "Saved {} domain policies and {} audit entries to {}",
+                                pols.len(),
+                                logs.len(),
+                                db_p.display()
+                            );
+                        }
+                        Err(e) => self.status_banner = e,
                     }
-                    Err(e) => self.status_banner = e,
                 }
             }
             if ui.button("Load Policies & Audit from SQLite").clicked() {
-                match LedgerStore::open(std::path::Path::new(&self.db_path_input))
-                    .and_then(|s| s.load_rate_policies_and_audit())
+                if let Some(db_p) = rfd::FileDialog::new()
+                    .add_filter("SQLite Ledger", &["db", "sqlite", "sqlite3"])
+                    .pick_file()
                 {
-                    Ok((pols, logs)) => {
-                        if let Ok(mut g) = global_limiter_mutex().lock() {
-                            g.restore_persisted_state(&pols, &logs);
+                    self.db_path_input = db_p.display().to_string();
+                    match LedgerStore::open(&db_p)
+                        .and_then(|s| s.load_rate_policies_and_audit())
+                    {
+                        Ok((pols, logs)) => {
+                            if let Ok(mut g) = global_limiter_mutex().lock() {
+                                g.restore_persisted_state(&pols, &logs);
+                            }
+                            policies = snapshot_global_policies();
+                            self.status_banner = format!(
+                                "Restored {} domain policies and {} audit rows from {}",
+                                pols.len(),
+                                logs.len(),
+                                db_p.display()
+                            );
                         }
-                        policies = snapshot_global_policies();
-                        self.status_banner = format!(
-                            "Restored {} domain policies and {} audit rows from {}",
-                            pols.len(),
-                            logs.len(),
-                            self.db_path_input
-                        );
+                        Err(e) => self.status_banner = e,
                     }
-                    Err(e) => self.status_banner = e,
                 }
             }
             if ui.button("Export Audit CSV").clicked() {
-                let p = std::path::Path::new("crawl_telemetry_audit.csv");
-                match export_crawl_audit_csv(&audit_rows, p) {
-                    Ok(_) => {
-                        self.status_banner = format!(
-                            "Exported crawl_telemetry_audit.csv ({} rows)",
-                            audit_rows.len()
-                        );
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .set_file_name("crawl_telemetry_audit.csv")
+                    .save_file()
+                {
+                    match export_crawl_audit_csv(&audit_rows, &p) {
+                        Ok(_) => {
+                            self.status_banner = format!(
+                                "Exported {} ({} rows)",
+                                p.display(),
+                                audit_rows.len()
+                            );
+                        }
+                        Err(e) => self.status_banner = e,
                     }
-                    Err(e) => self.status_banner = e,
                 }
             }
             if ui.button("Export Policies CSV").clicked() {
-                let p = std::path::Path::new("domain_rate_policies.csv");
-                match export_domain_policies_csv(&policies, p) {
-                    Ok(_) => {
-                        self.status_banner = "Exported domain_rate_policies.csv".to_string();
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .set_file_name("domain_rate_policies.csv")
+                    .save_file()
+                {
+                    match export_domain_policies_csv(&policies, &p) {
+                        Ok(_) => {
+                            self.status_banner = format!("Exported {}", p.display());
+                        }
+                        Err(e) => self.status_banner = e,
                     }
-                    Err(e) => self.status_banner = e,
                 }
             }
 
@@ -5877,12 +7033,143 @@ impl CitAtlasApp {
     }
 }
 
+pub fn cit_atlas_icon_data() -> egui::IconData {
+    egui::IconData {
+        rgba: include_bytes!("../assets/cit-atlas-icon-64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    }
+}
+
+pub fn compute_robust_symmetric_bound(vals: &[f32], min_floor: f32) -> (f32, usize) {
+    let mut mags: Vec<f32> = vals
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .map(f32::abs)
+        .collect();
+    if mags.is_empty() {
+        return (min_floor.max(1e-3), 0);
+    }
+    mags.sort_by(|a, b| a.total_cmp(b));
+    let max_mag = *mags.last().unwrap_or(&0.0);
+    let bound = if mags.len() >= 8 {
+        let idx92 = ((mags.len() - 1) as f32 * 0.92).floor() as usize;
+        let p92 = mags[idx92.min(mags.len() - 1)];
+        if max_mag > p92 * 1.8 && p92 > 0.0 {
+            (p92 * 1.25).max(min_floor)
+        } else {
+            (max_mag * 1.2).max(min_floor)
+        }
+    } else {
+        (max_mag * 1.2).max(min_floor)
+    };
+    let outliers = mags.iter().filter(|&&m| m > bound).count();
+    (bound, outliers)
+}
+
+pub fn compute_robust_upper_bound(vals: &[f32], min_floor: f32) -> (f32, usize) {
+    let mut pos: Vec<f32> = vals
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .map(|v| v.max(0.0))
+        .collect();
+    if pos.is_empty() {
+        return (min_floor.max(1e-3), 0);
+    }
+    pos.sort_by(|a, b| a.total_cmp(b));
+    let max_val = *pos.last().unwrap_or(&0.0);
+    let bound = if pos.len() >= 8 {
+        let idx92 = ((pos.len() - 1) as f32 * 0.92).floor() as usize;
+        let p92 = pos[idx92.min(pos.len() - 1)];
+        if max_val > p92 * 2.0 && p92 > 0.0 {
+            (p92 * 1.25).max(min_floor)
+        } else {
+            (max_val * 1.12).max(min_floor)
+        }
+    } else {
+        (max_val * 1.12).max(min_floor)
+    };
+    let outliers = pos.iter().filter(|&&v| v > bound).count();
+    (bound, outliers)
+}
+
+pub fn nice_year_ticks(min_yr: i32, max_yr: i32, max_ticks: usize) -> Vec<i32> {
+    if max_yr <= min_yr {
+        return vec![min_yr];
+    }
+    let span = (max_yr - min_yr) as f64;
+    let target = max_ticks.max(2) as f64;
+    let raw_step = (span / target).max(1.0);
+    let candidates = [1, 2, 5, 10, 15, 20, 25, 50, 100];
+    let step = candidates
+        .iter()
+        .copied()
+        .find(|&s| (s as f64) >= raw_step)
+        .unwrap_or(100);
+    let mut ticks = Vec::new();
+    let first = if min_yr % step == 0 {
+        min_yr
+    } else {
+        ((min_yr as f64 / step as f64).ceil() as i32) * step
+    };
+    let mut y = first;
+    while y <= max_yr {
+        ticks.push(y);
+        y += step;
+    }
+    if ticks.first().copied() != Some(min_yr) && (ticks.first().copied().unwrap_or(max_yr) - min_yr) >= step / 2 {
+        ticks.insert(0, min_yr);
+    }
+    if ticks.last().copied() != Some(max_yr) && (max_yr - ticks.last().copied().unwrap_or(min_yr)) >= step / 2 {
+        ticks.push(max_yr);
+    }
+    if ticks.is_empty() {
+        ticks.push(min_yr);
+        ticks.push(max_yr);
+    }
+    ticks
+}
+
+pub fn nice_linear_ticks(min_v: f32, max_v: f32, target_count: usize) -> Vec<f32> {
+    let span = (max_v - min_v).abs();
+    if span <= 1e-6 {
+        return vec![min_v];
+    }
+    let raw_step = span / (target_count.max(2) as f32);
+    let exp = raw_step.log10().floor();
+    let base = 10.0f32.powf(exp);
+    let frac = raw_step / base;
+    let nice_frac = if frac <= 1.0 {
+        1.0
+    } else if frac <= 2.0 {
+        2.0
+    } else if frac <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    let step = nice_frac * base;
+    let start = (min_v / step).ceil() * step;
+    let mut ticks = Vec::new();
+    let mut cur = start;
+    let mut guard = 0usize;
+    while cur <= max_v + step * 0.001 && guard < 32 {
+        ticks.push(if cur.abs() < step * 1e-4 { 0.0 } else { cur });
+        cur += step;
+        guard += 1;
+    }
+    ticks
+}
+
 pub fn run_native_gui() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1480.0, 920.0])
-            .with_min_inner_size([960.0, 620.0]),
+            .with_min_inner_size([960.0, 620.0])
+            .with_icon(Arc::new(cit_atlas_icon_data())),
         ..Default::default()
     };
     eframe::run_native(
@@ -5922,60 +7209,24 @@ fn write_rgba_png(
     height: u32,
     rgba: &[u8],
 ) -> std::io::Result<()> {
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = 0xFFFF_FFFFu32;
-        for &b in data {
-            crc ^= b as u32;
-            for _ in 0..8 {
-                crc = if (crc & 1) != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
-            }
-        }
-        !crc
-    }
-    fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
-        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        let start = out.len();
-        out.extend_from_slice(tag);
-        out.extend_from_slice(payload);
-        out.extend_from_slice(&crc32(&out[start..]).to_be_bytes());
-    }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let row_bytes = width as usize * 4;
-    let mut raw = Vec::with_capacity(height as usize * (1 + row_bytes));
-    for row in rgba.chunks_exact(row_bytes) {
-        raw.push(0);
-        raw.extend_from_slice(row);
-    }
-    let (mut s1, mut s2) = (1u32, 0u32);
-    for &b in &raw {
-        s1 = (s1 + b as u32) % 65521;
-        s2 = (s2 + s1) % 65521;
-    }
-    let mut zlib = Vec::with_capacity(raw.len() + 32);
-    zlib.extend_from_slice(&[0x78, 0x01]);
-    let chunks: Vec<&[u8]> = if raw.is_empty() { vec![&[]] } else { raw.chunks(65535).collect() };
-    for (i, chunk) in chunks.iter().enumerate() {
-        zlib.push(if i + 1 == chunks.len() { 1 } else { 0 });
-        let len = chunk.len() as u16;
-        zlib.extend_from_slice(&len.to_le_bytes());
-        zlib.extend_from_slice(&(!len).to_le_bytes());
-        zlib.extend_from_slice(chunk);
-    }
-    zlib.extend_from_slice(&((s2 << 16) | s1).to_be_bytes());
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-    let mut png = Vec::with_capacity(zlib.len() + 64);
-    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    push_chunk(&mut png, b"IHDR", &ihdr);
-    push_chunk(&mut png, b"IDAT", &zlib);
-    push_chunk(&mut png, b"IEND", &[]);
-    std::fs::write(path, png)
+    let file = std::fs::File::create(path)?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::High);
+    let mut png_writer = encoder
+        .write_header()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    png_writer
+        .write_image_data(rgba)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    Ok(())
 }
 
 pub fn capture_headless_screenshot(
@@ -6159,4 +7410,99 @@ pub fn capture_headless_screenshot_view(
         out_png.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn robust_phase_bounds_prevent_single_outlier_collapse() {
+        let (papers, edges) = build_empirical_corpus();
+        let analytics = compute_corpus_analytics(&papers, &edges, &AnalyticsParams::default());
+        let accels: Vec<f32> = analytics.papers.iter().map(|p| p.accel as f32).collect();
+        let (bound, outliers) = compute_robust_symmetric_bound(&accels, 0.18);
+        assert!(
+            bound < 0.35,
+            "Expected outlier-robust symmetric bound < 0.35 so bulk points aren't squashed, got {}",
+            bound
+        );
+        assert!(
+            outliers >= 1,
+            "Expected at least 1 clipped outlier (e.g. rives2021), got {}",
+            outliers
+        );
+    }
+
+    #[test]
+    fn nice_year_ticks_cover_corpus_span() {
+        let ticks = nice_year_ticks(1948, 2026, 6);
+        assert!(ticks.len() >= 4, "Expected at least 4 year ticks, got {:?}", ticks);
+        for w in ticks.windows(2) {
+            assert!(w[1] > w[0], "Year ticks must strictly increase: {:?}", ticks);
+        }
+        assert!(ticks[0] >= 1948 && *ticks.last().unwrap() <= 2026);
+    }
+
+    #[test]
+    fn direct_node_inspection_selects_datacite_and_bio_entity_without_clobbering_focal_paper() {
+        let ctx = egui::Context::default();
+        let mut app = CitAtlasApp::new_with_ctx(&ctx, false, "test".to_string());
+        app.select_paper("shannon1948".to_string());
+        assert_eq!(app.focused_paper_id, "shannon1948");
+        assert_eq!(
+            app.dossier_selection,
+            DossierSelection::Paper("shannon1948".to_string())
+        );
+
+        app.dossier_selection = DossierSelection::DataCiteArtifact("10.5281/zenodo.12345".to_string());
+        app.show_dossier_panel = true;
+        assert_eq!(app.focused_paper_id, "shannon1948");
+        assert_eq!(
+            app.dossier_selection,
+            DossierSelection::DataCiteArtifact("10.5281/zenodo.12345".to_string())
+        );
+
+        app.dossier_selection = DossierSelection::BioEntity(BioEntityKind::UniProt, "P0DTC2".to_string());
+        assert_eq!(app.focused_paper_id, "shannon1948");
+        assert_eq!(
+            app.dossier_selection,
+            DossierSelection::BioEntity(BioEntityKind::UniProt, "P0DTC2".to_string())
+        );
+    }
+
+    #[test]
+    fn write_rgba_png_uses_deflate_compression_and_valid_header() {
+        let tmp = std::env::temp_dir().join(format!("cit_atlas_png_test_{}.png", std::process::id()));
+        let w = 256u32;
+        let h = 256u32;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                rgba[idx] = (x & 0xFF) as u8;
+                rgba[idx + 1] = (y & 0xFF) as u8;
+                rgba[idx + 2] = 42;
+                rgba[idx + 3] = 255;
+            }
+        }
+        write_rgba_png(&tmp, w, h, &rgba).expect("write PNG");
+        let bytes = std::fs::read(&tmp).expect("read PNG");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        // Uncompressed 256x256x4 would be >262KB; DEFLATE compressed must be much smaller
+        assert!(
+            bytes.len() < 40_000,
+            "Expected compressed PNG < 40KB, got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn embedded_icon_data_has_valid_64x64_rgba_dimensions() {
+        let icon = cit_atlas_icon_data();
+        assert_eq!(icon.width, 64);
+        assert_eq!(icon.height, 64);
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+    }
 }

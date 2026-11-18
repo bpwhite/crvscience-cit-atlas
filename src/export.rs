@@ -90,11 +90,11 @@ pub fn format_bibtex_corpus(papers: &[PaperRecord]) -> String {
     out
 }
 
-/// 1. Paper-level scientometrics, Retraction Watch integrity, & DataCite bridge CSV (`papers_metrics.csv`, 53 columns).
+/// 1. Paper-level scientometrics, Retraction Watch integrity, & DataCite bridge CSV (`papers_metrics.csv`, 63 columns).
 pub fn export_metrics_csv(analytics: &CorpusAnalytics, path: &Path) -> Result<(), String> {
     let mut lines = Vec::with_capacity(analytics.papers.len() + 1);
     lines.push(
-        "id,year,discipline,louvain_comm,infomap_module,infomap_flow_pct,reclassified_louvain,reclassified_infomap,authors,title,venue,doi,arxiv_id,pmcid,oa_status,retraction_status,retraction_source,retraction_date,retraction_notice_doi,retraction_watch_record_id,retraction_reasons,post_retraction_cites,cites_retracted_count,datacite_dataset_count,datacite_software_count,datacite_shared_peers,datacite_total_downloads,datacite_artifact_dois,uniprot_bridge_count,pdb_bridge_count,epmc_annotation_count,shared_bio_entity_peers,uniprot_accessions,pdb_structure_ids,bio_entity_bridges,in_citations,out_references,undir_degree,external_citations,v_exp,v_window,accel_dv_dt,immed_5y_pct,beauty_B,awaken_year,hibernation_years,disruption_CD,brandes_CB_undir,brandes_CB_dir,participation_P,louvain_P,infomap_P,within_z,burt_C,bridge_score,guimera_role,oa_pdf_url,local_pdf_path,pdf_sha256,source_url"
+        "id,year,discipline,louvain_comm,infomap_module,infomap_flow_pct,reclassified_louvain,reclassified_infomap,authors,title,venue,doi,arxiv_id,pmcid,oa_status,retraction_status,retraction_source,retraction_date,retraction_notice_doi,retraction_watch_record_id,retraction_reasons,post_retraction_cites,cites_retracted_count,datacite_dataset_count,datacite_software_count,datacite_shared_peers,datacite_total_downloads,datacite_artifact_dois,uniprot_bridge_count,pdb_bridge_count,epmc_annotation_count,shared_bio_entity_peers,uniprot_accessions,pdb_structure_ids,bio_entity_bridges,in_citations,out_references,undir_degree,external_citations,v_exp,v_window,accel_dv_dt,immed_5y_pct,beauty_B,awaken_year,hibernation_years,disruption_CD,disruption_CD5,hits_hub,hits_authority,brandes_CB_undir,brandes_CB_dir,participation_P,louvain_P,infomap_P,within_z,burt_C,bridge_score,guimera_role,oa_pdf_url,local_pdf_path,pdf_sha256,source_url"
             .to_string(),
     );
 
@@ -102,7 +102,7 @@ pub fn export_metrics_csv(analytics: &CorpusAnalytics, path: &Path) -> Result<()
         let r = &p.record;
         let ret = &r.retraction;
         lines.push(format!(
-            "{},{},{},L{},M{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.1},{:.2},{},{},{:.4},{:.5},{:.5},{:.4},{:.4},{:.4},{:.3},{:.4},{:.4},{},{},{},{},{}",
+            "{},{},{},L{},M{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.1},{:.2},{},{},{:.4},{:.4},{:.6},{:.6},{:.5},{:.5},{:.4},{:.4},{:.4},{:.3},{:.4},{:.4},{},{},{},{},{}",
             csv_escape(&r.id),
             r.year,
             r.disc.code(),
@@ -150,6 +150,9 @@ pub fn export_metrics_csv(analytics: &CorpusAnalytics, path: &Path) -> Result<()
             p.awaken_year,
             p.hibernation_years,
             p.disruption_cd,
+            p.disruption_cd5,
+            p.hits_hub,
+            p.hits_authority,
             p.cb_undir,
             p.cb_dir,
             p.part_p,
@@ -862,7 +865,7 @@ pub fn export_all_csv_suite(
     export_crawl_audit_csv(&audit_rows, &p_audit)?;
     written.push("crawl_telemetry_audit.csv".to_string());
 
-    let _ = export_domain_policies_csv(&snapshot_global_policies(), &out_dir.join("domain_rate_policies.csv"));
+    export_domain_policies_csv(&snapshot_global_policies(), &out_dir.join("domain_rate_policies.csv"))?;
 
     Ok(written)
 }
@@ -1059,6 +1062,9 @@ pub fn export_graphml(
         ("n_beauty", "beauty_b", "double"),
         ("n_awaken", "awaken_year", "int"),
         ("n_cd", "disruption_cd", "double"),
+        ("n_cd5", "disruption_cd5", "double"),
+        ("n_hits_hub", "hits_hub", "double"),
+        ("n_hits_auth", "hits_authority", "double"),
         ("n_cbu", "brandes_cb_undir", "double"),
         ("n_cbd", "brandes_cb_dir", "double"),
         ("n_part", "participation_p", "double"),
@@ -1143,6 +1149,9 @@ pub fn export_graphml(
         out.push_str(&format!("      <data key=\"n_beauty\">{:.2}</data>\n", p.beauty_b));
         out.push_str(&format!("      <data key=\"n_awaken\">{}</data>\n", p.awaken_year));
         out.push_str(&format!("      <data key=\"n_cd\">{:.4}</data>\n", p.disruption_cd));
+        out.push_str(&format!("      <data key=\"n_cd5\">{:.4}</data>\n", p.disruption_cd5));
+        out.push_str(&format!("      <data key=\"n_hits_hub\">{:.6}</data>\n", p.hits_hub));
+        out.push_str(&format!("      <data key=\"n_hits_auth\">{:.6}</data>\n", p.hits_authority));
         out.push_str(&format!("      <data key=\"n_cbu\">{:.5}</data>\n", p.cb_undir));
         out.push_str(&format!("      <data key=\"n_cbd\">{:.5}</data>\n", p.cb_dir));
         out.push_str(&format!("      <data key=\"n_part\">{:.4}</data>\n", p.part_p));
@@ -1397,6 +1406,9 @@ pub fn export_gexf(
         ("20", "uniprot_bridge_count", "integer"),
         ("21", "pdb_bridge_count", "integer"),
         ("22", "epmc_annotation_count", "integer"),
+        ("23", "disruption_cd5", "double"),
+        ("24", "hits_hub", "double"),
+        ("25", "hits_authority", "double"),
     ];
     out.push_str("    <attributes class=\"node\" mode=\"static\">\n");
     for (aid, title, atype) in node_attrs {
@@ -1470,6 +1482,9 @@ pub fn export_gexf(
         out.push_str(&format!("          <attvalue for=\"20\" value=\"{}\"/>\n", p.uniprot_bridge_count));
         out.push_str(&format!("          <attvalue for=\"21\" value=\"{}\"/>\n", p.pdb_bridge_count));
         out.push_str(&format!("          <attvalue for=\"22\" value=\"{}\"/>\n", p.epmc_annotation_count));
+        out.push_str(&format!("          <attvalue for=\"23\" value=\"{:.4}\"/>\n", p.disruption_cd5));
+        out.push_str(&format!("          <attvalue for=\"24\" value=\"{:.6}\"/>\n", p.hits_hub));
+        out.push_str(&format!("          <attvalue for=\"25\" value=\"{:.6}\"/>\n", p.hits_authority));
         out.push_str("        </attvalues>\n");
         out.push_str(&format!("        <viz:size value=\"{:.2}\"/>\n", sz));
         out.push_str(&format!("        <viz:position x=\"{:.2}\" y=\"{:.2}\" z=\"0.0\"/>\n", gx, gy));

@@ -77,6 +77,9 @@ pub fn compute_corpus_analytics(
         undir_sets[u].insert(v);
         undir_sets[v].insert(u);
     }
+    for list in &mut in_adj {
+        list.sort_unstable_by_key(|&w| (active_records[w].year, w));
+    }
     let undir_adj: Vec<Vec<usize>> = undir_sets
         .iter()
         .map(|s| {
@@ -89,6 +92,7 @@ pub fn compute_corpus_analytics(
     // 1. Rayon-Parallel Exact Brandes (2001) Vertex & Edge Betweenness Centrality
     let (cb_undir, eb_undir) = run_parallel_brandes(n, &undir_adj, false);
     let (cb_dir, eb_dir) = run_parallel_brandes(n, &out_adj, true);
+    let (hits_hub, hits_auth) = compute_hits_on_dag(&out_adj, &in_adj, 30);
 
     // 1b. Multi-Level Louvain Modularity Q(gamma) & Random-Walk Infomap Flow Compression L(M)
     let disc_vec: Vec<Discipline> = active_records.iter().map(|r| r.disc).collect();
@@ -303,34 +307,72 @@ pub fn compute_corpus_analytics(
             }
             beauty_b = beauty_b.max(0.0);
 
-            // Sparse O(d_in + d_out * avg_in) exact Disruption Index CD_i
+            // Sparse O(d_in + d_out * log d_in) exact all-time Disruption Index CD_i and 5-year CD5_i (no .take(512) cap)
             let refs_set: HashSet<usize> = out_adj[i].iter().copied().collect();
             let (mut ni, mut nj, mut nk) = (0usize, 0usize, 0usize);
-            if refs_set.is_empty() {
-                ni = in_deg;
-            } else {
-                let mut citer_set: HashSet<usize> = HashSet::with_capacity(in_adj[i].len());
-                for &w in &in_adj[i] {
-                    if w != i && active_records[w].year >= pub_yr {
-                        citer_set.insert(w);
-                        let cites_ref = out_adj[w].iter().any(|r| refs_set.contains(r));
-                        if cites_ref {
-                            nj += 1;
-                        } else {
+            let (mut ni5, mut nj5, mut nk5) = (0usize, 0usize, 0usize);
+            if pub_yr > 0 {
+                let win_end = pub_yr.saturating_add(5);
+                if refs_set.is_empty() {
+                    let lo_all = in_adj[i].partition_point(|&w| active_records[w].year < pub_yr);
+                    for &w in &in_adj[i][lo_all..] {
+                        if w != i && active_records[w].year > 0 {
                             ni += 1;
                         }
                     }
-                }
-                if in_deg > 0 || out_deg <= 24 {
+                    let lo_5 = in_adj[i].partition_point(|&w| active_records[w].year <= pub_yr);
+                    let hi_5 = in_adj[i].partition_point(|&w| active_records[w].year <= win_end);
+                    for &w in &in_adj[i][lo_5..hi_5] {
+                        if w != i {
+                            ni5 += 1;
+                        }
+                    }
+                } else {
+                    let mut citer_set: HashSet<usize> = HashSet::with_capacity(in_adj[i].len());
+                    let mut citer_set_5: HashSet<usize> = HashSet::new();
+                    let lo_all = in_adj[i].partition_point(|&w| active_records[w].year < pub_yr);
+                    for &w in &in_adj[i][lo_all..] {
+                        let c_yr = active_records[w].year;
+                        if w != i && c_yr > 0 {
+                            citer_set.insert(w);
+                            let cites_ref = out_adj[w].iter().any(|r| refs_set.contains(r));
+                            if cites_ref {
+                                nj += 1;
+                            } else {
+                                ni += 1;
+                            }
+                            if c_yr > pub_yr && c_yr <= win_end {
+                                citer_set_5.insert(w);
+                                if cites_ref {
+                                    nj5 += 1;
+                                } else {
+                                    ni5 += 1;
+                                }
+                            }
+                        }
+                    }
+
                     let mut seen_nk: HashSet<usize> = HashSet::new();
+                    let mut seen_nk_5: HashSet<usize> = HashSet::new();
                     for &r_idx in &out_adj[i] {
-                        for &w in &in_adj[r_idx].iter().take(512).copied().collect::<Vec<_>>() {
+                        let lo_r_all =
+                            in_adj[r_idx].partition_point(|&w| active_records[w].year < pub_yr);
+                        for &w in &in_adj[r_idx][lo_r_all..] {
                             if w != i
-                                && active_records[w].year >= pub_yr
+                                && active_records[w].year > 0
                                 && !citer_set.contains(&w)
                                 && seen_nk.insert(w)
                             {
                                 nk += 1;
+                            }
+                        }
+                        let lo_r_5 =
+                            in_adj[r_idx].partition_point(|&w| active_records[w].year <= pub_yr);
+                        let hi_r_5 =
+                            in_adj[r_idx].partition_point(|&w| active_records[w].year <= win_end);
+                        for &w in &in_adj[r_idx][lo_r_5..hi_r_5] {
+                            if w != i && !citer_set_5.contains(&w) && seen_nk_5.insert(w) {
+                                nk5 += 1;
                             }
                         }
                     }
@@ -339,6 +381,12 @@ pub fn compute_corpus_analytics(
             let cd_denom = ni + nj + nk;
             let disruption_cd = if cd_denom > 0 {
                 ((ni as f64) - (nj as f64)) / (cd_denom as f64)
+            } else {
+                0.0
+            };
+            let cd5_denom = ni5 + nj5 + nk5;
+            let disruption_cd5 = if cd5_denom > 0 {
+                ((ni5 as f64) - (nj5 as f64)) / (cd5_denom as f64)
             } else {
                 0.0
             };
@@ -422,6 +470,9 @@ pub fn compute_corpus_analytics(
                 hibernation_years: awaken_year - pub_yr,
                 peak_age_tm: tm,
                 disruption_cd,
+                disruption_cd5,
+                hits_hub: hits_hub[i],
+                hits_authority: hits_auth[i],
                 cb_undir: cb_undir[i],
                 cb_dir: cb_dir[i],
                 part_p: part_p[i],
@@ -893,6 +944,78 @@ pub fn find_shortest_epistemic_path(
     None
 }
 
+/// Deterministic HITS Hub & Authority power iteration on the citation DAG (`out_adj` / `in_adj`).
+pub fn compute_hits_on_dag(
+    out_adj: &[Vec<usize>],
+    in_adj: &[Vec<usize>],
+    iters: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = out_adj.len().min(in_adj.len());
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let init = 1.0 / (n as f64).sqrt();
+    let mut hub = vec![init; n];
+    let mut auth = vec![init; n];
+    if iters == 0 {
+        return (hub, auth);
+    }
+
+    for _ in 0..iters {
+        let mut next_auth = vec![0.0_f64; n];
+        for (v, citers) in in_adj.iter().take(n).enumerate() {
+            let mut sum = 0.0;
+            for &u in citers {
+                if u < n {
+                    sum += hub[u];
+                }
+            }
+            next_auth[v] = sum;
+        }
+        let norm_a = next_auth.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm_a > 1e-12 {
+            for x in &mut next_auth {
+                *x /= norm_a;
+            }
+        } else {
+            next_auth.fill(0.0);
+        }
+
+        let mut next_hub = vec![0.0_f64; n];
+        for (u, refs) in out_adj.iter().take(n).enumerate() {
+            let mut sum = 0.0;
+            for &v in refs {
+                if v < n {
+                    sum += next_auth[v];
+                }
+            }
+            next_hub[u] = sum;
+        }
+        let norm_h = next_hub.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm_h > 1e-12 {
+            for x in &mut next_hub {
+                *x /= norm_h;
+            }
+        } else {
+            next_hub.fill(0.0);
+        }
+
+        let max_delta = auth
+            .iter()
+            .zip(next_auth.iter())
+            .chain(hub.iter().zip(next_hub.iter()))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+
+        auth = next_auth;
+        hub = next_hub;
+        if max_delta < 1e-10 {
+            break;
+        }
+    }
+    (hub, auth)
+}
+
 /// "Publish or Perish"-compatible bibliometric citation impact summary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PopCitationMetrics {
@@ -913,38 +1036,326 @@ pub struct PopCitationMetrics {
     pub ha_index: usize,
 }
 
-/// Counts distinct authors in a bibliography string such as `"A. Smith, B. Jones"` or `"Smith, A."`.
+fn is_initial_token(tok: &str) -> bool {
+    let t = tok.trim();
+    if t.is_empty()
+        || t.eq_ignore_ascii_case("et")
+        || t.eq_ignore_ascii_case("al.")
+        || t.eq_ignore_ascii_case("al")
+    {
+        return false;
+    }
+    if t.ends_with('.') {
+        let parts: Vec<&str> = t
+            .trim_end_matches('.')
+            .split(['.', '-'])
+            .filter(|p| !p.is_empty())
+            .collect();
+        !parts.is_empty()
+            && parts
+                .iter()
+                .all(|p| p.chars().count() <= 2 && p.chars().all(|c| c.is_alphabetic()))
+    } else {
+        t.chars().count() == 1 && t.chars().all(|c| c.is_alphabetic())
+    }
+}
+
+fn is_surname_word(tok: &str) -> bool {
+    !tok.contains('.')
+        && tok.chars().count() >= 2
+        && !tok.eq_ignore_ascii_case("et")
+        && !tok.eq_ignore_ascii_case("al")
+        && !tok.eq_ignore_ascii_case("and")
+        && tok.chars().any(|c| c.is_alphabetic())
+}
+
+fn is_unambiguous_surname_particle(lower: &str) -> bool {
+    matches!(
+        lower,
+        "de" | "del"
+            | "della"
+            | "degli"
+            | "dei"
+            | "des"
+            | "da"
+            | "dos"
+            | "das"
+            | "du"
+            | "von"
+            | "vom"
+            | "st."
+            | "ste."
+            | "santa"
+            | "ibn"
+            | "bin"
+            | "abu"
+            | "ter"
+            | "ten"
+            | "op"
+            | "zu"
+            | "zum"
+            | "zur"
+            | "fitz"
+            | "ap"
+            | "ab"
+    )
+}
+
+fn is_surname_particle_token(lower: &str) -> bool {
+    is_unambiguous_surname_particle(lower)
+        || matches!(
+            lower,
+            "van"
+                | "di"
+                | "do"
+                | "la"
+                | "le"
+                | "les"
+                | "lo"
+                | "al"
+                | "el"
+                | "ben"
+                | "mac"
+                | "mc"
+                | "san"
+                | "santo"
+                | "st"
+                | "ste"
+                | "der"
+                | "den"
+                | "dem"
+                | "te"
+                | "het"
+                | "bar"
+                | "af"
+                | "av"
+        )
+}
+
+fn match_compound_particle(t0_lower: &str, t1_lower: &str) -> bool {
+    matches!(
+        (t0_lower, t1_lower),
+        ("de", "la")
+            | ("de", "los")
+            | ("de", "las")
+            | ("de", "lo")
+            | ("van", "der")
+            | ("van", "den")
+            | ("van", "de")
+            | ("von", "der")
+            | ("von", "dem")
+            | ("von", "den")
+            | ("op", "den")
+            | ("op", "de")
+            | ("op", "het")
+            | ("in", "de")
+            | ("in", "den")
+            | ("auf", "der")
+    )
+}
+
+/// Evaluates whether a comma-separated segment looks like a `"Family"` surname segment
+/// (either a single-word surname or a recognized particle/compound surname with no initial tokens).
+/// Returns `Some(true)` if unambiguously a surname even when followed by a two-word given name,
+/// or `Some(false)` if it starts with a capitalized particle that can also act as a given name.
+fn classify_family_name_segment(seg: &str) -> Option<bool> {
+    let toks: Vec<&str> = seg.split_whitespace().collect();
+    if toks.is_empty() {
+        return None;
+    }
+    if toks.len() == 1 {
+        let first = toks[0];
+        return if !first.contains('.') && first.chars().count() >= 2 {
+            Some(true)
+        } else {
+            None
+        };
+    }
+
+    let lower: Vec<String> = toks.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let mut idx = 0usize;
+    let mut matched_compound = false;
+
+    while idx + 1 < toks.len() {
+        if idx + 2 < toks.len() && match_compound_particle(&lower[idx], &lower[idx + 1]) {
+            if idx == 0 {
+                matched_compound = true;
+            }
+            idx += 2;
+            continue;
+        }
+        if is_surname_particle_token(&lower[idx]) {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+
+    if idx == 0 || idx >= toks.len() {
+        return None;
+    }
+
+    let remaining = &toks[idx..];
+    if remaining.len() > 2 || !remaining.iter().all(|t| is_surname_word(t)) {
+        return None;
+    }
+
+    let starts_lowercase = toks[0].chars().next().is_some_and(|c| c.is_lowercase());
+    let unambiguous =
+        starts_lowercase || matched_compound || is_unambiguous_surname_particle(&lower[0]);
+    Some(unambiguous)
+}
+
+fn is_family_name_segment(seg: &str) -> bool {
+    classify_family_name_segment(seg).is_some()
+}
+
+fn strip_et_al(input: &str) -> (String, bool) {
+    let mut s = input.trim().to_string();
+    let mut found = false;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(pos) = lower.find("et al.") else {
+            break;
+        };
+        found = true;
+        let end = pos + "et al.".len();
+        let mut start = pos;
+        let before = &s[..pos];
+        if let Some(trimmed_before) = before.strip_suffix(", ") {
+            start = trimmed_before.len();
+        } else if let Some(trimmed_before) = before.strip_suffix(',') {
+            start = trimmed_before.len();
+        }
+        let mut rebuilt = String::with_capacity(s.len());
+        rebuilt.push_str(s[..start].trim_end());
+        let after = s[end..].trim_start();
+        if !rebuilt.is_empty() && !after.is_empty() {
+            rebuilt.push(' ');
+        }
+        rebuilt.push_str(after);
+        s = rebuilt;
+    }
+    (s, found)
+}
+
+fn split_on_and_conjunction(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    for tok in s.split_whitespace() {
+        if tok.eq_ignore_ascii_case("and") {
+            if !cur.is_empty() {
+                out.push(cur.join(" "));
+                cur.clear();
+            }
+        } else {
+            cur.push(tok);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur.join(" "));
+    }
+    out
+}
+
+fn count_comma_author_group(group: &str) -> usize {
+    let segments: Vec<&str> = group
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return 0;
+    }
+    if segments.len() == 1 {
+        return 1;
+    }
+
+    // Single-author "Family, Given" (e.g. "Shannon, Claude", "de la Cruz, Juan", "van der Waals, Johannes D.")
+    if segments.len() == 2 {
+        if let Some(unambiguous_two_word_given) = classify_family_name_segment(segments[0]) {
+            let seg1_toks: Vec<&str> = segments[1].split_whitespace().collect();
+            let all_initials =
+                !seg1_toks.is_empty() && seg1_toks.iter().all(|t| is_initial_token(t));
+            let single_or_given_plus_init = !seg1_toks.is_empty()
+                && ((seg1_toks.len() == 1
+                    && !seg1_toks[0].eq_ignore_ascii_case("et")
+                    && !seg1_toks[0].eq_ignore_ascii_case("al."))
+                    || (seg1_toks.len() == 2
+                        && !seg1_toks[0].contains('.')
+                        && !seg1_toks[0].eq_ignore_ascii_case("et")
+                        && is_initial_token(seg1_toks[1])));
+            let two_word_given = unambiguous_two_word_given
+                && seg1_toks.len() == 2
+                && seg1_toks
+                    .iter()
+                    .all(|t| !t.eq_ignore_ascii_case("et") && !t.eq_ignore_ascii_case("al."));
+            if all_initials || single_or_given_plus_init || two_word_given {
+                return 1;
+            }
+        }
+    }
+
+    // Alternating "Family, Given, Family2, Given2, ..."
+    if segments.len() >= 4 && segments.len() % 2 == 0 {
+        let all_pairs = segments.chunks_exact(2).all(|pair| {
+            if !is_family_name_segment(pair[0]) {
+                return false;
+            }
+            let toks: Vec<&str> = pair[1].split_whitespace().collect();
+            if toks.is_empty() {
+                return false;
+            }
+            let all_init = toks.iter().all(|t| is_initial_token(t));
+            let single_given =
+                toks.len() == 1 && !toks[0].contains('.') && toks[0].chars().count() >= 2;
+            let given_plus_init =
+                toks.len() == 2 && !toks[0].contains('.') && is_initial_token(toks[1]);
+            all_init || single_given || given_plus_init
+        });
+        if all_pairs {
+            return segments.len() / 2;
+        }
+    }
+
+    // General comma-separated list: only merge trailing initials into a recognized surname segment
+    let mut author_count = 0usize;
+    let mut i = 0usize;
+    while i < segments.len() {
+        author_count += 1;
+        if i + 1 < segments.len() && is_family_name_segment(segments[i]) {
+            let next_toks: Vec<&str> = segments[i + 1].split_whitespace().collect();
+            if !next_toks.is_empty() && next_toks.iter().all(|t| is_initial_token(t)) {
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    author_count
+}
+
+/// Counts distinct authors in a bibliography string such as `"A. Smith, B. Jones"` or `"Shannon, Claude"`.
 pub fn count_paper_authors(authors: &str) -> usize {
     let trimmed = authors.trim();
     if trimmed.is_empty() {
         return 1;
     }
-    let has_et_al = trimmed.to_ascii_lowercase().contains("et al.");
-    let cleaned = trimmed
-        .replace(", et al.", "")
-        .replace("et al.", "")
-        .replace(" and ", ", ");
-
-    let segments: Vec<&str> = if cleaned.contains(';') {
-        cleaned.split(';').map(str::trim).filter(|s| !s.is_empty()).collect()
-    } else {
-        cleaned.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
-    };
-
-    if segments.is_empty() {
+    let (cleaned, has_et_al) = strip_et_al(trimmed);
+    if cleaned.is_empty() {
         return 1;
     }
 
     let mut author_count = 0usize;
-    for (idx, seg) in segments.iter().enumerate() {
-        let is_initials_only = idx > 0
-            && !cleaned.contains(';')
-            && seg.split_whitespace().all(|tok| {
-                let letters = tok.trim_end_matches('.');
-                !letters.is_empty() && letters.chars().count() <= 2
-            });
-        if !is_initials_only {
-            author_count += 1;
+    if cleaned.contains(';') {
+        for semi_part in cleaned.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            for and_part in split_on_and_conjunction(semi_part) {
+                author_count += count_comma_author_group(&and_part);
+            }
+        }
+    } else {
+        for and_part in split_on_and_conjunction(&cleaned) {
+            author_count += count_comma_author_group(&and_part);
         }
     }
     (author_count + usize::from(has_et_al)).max(1)
@@ -993,7 +1404,7 @@ pub fn compute_pop_citation_metrics_from_pairs(
     let year_span = (horizon_year - min_year + 1).max(1);
     let cites_per_year = (total_citations as f64) / (year_span as f64);
     let cites_per_paper = (total_citations as f64) / (total_papers as f64);
-    let cites_per_author = total_author_norm_cites;
+    let cites_per_author = total_author_norm_cites / (total_papers as f64);
     let authors_per_paper = (total_authors_sum as f64) / (total_papers as f64);
 
     cites.sort_unstable_by(|a, b| b.cmp(a));
@@ -1140,7 +1551,8 @@ mod pop_tests {
         assert!((m.hi_annual - 0.5).abs() < 1e-6);
         // annual_rates desc = [5.0, 3.0, 2.4, 1.0] -> ha_index = 2 (5.0>=1, 3.0>=2, 2.4<3)
         assert_eq!(m.ha_index, 2);
-        assert!((m.cites_per_author - 40.0).abs() < 1e-6);
+        // Mean author-normalized citations per paper = (30 + 6 + 3 + 1) / 4 = 10.0
+        assert!((m.cites_per_author - 10.0).abs() < 1e-6);
         assert!((m.authors_per_paper - 2.0).abs() < 1e-6);
         assert!((m.cites_per_paper - 13.25).abs() < 1e-6);
     }
@@ -1148,7 +1560,260 @@ mod pop_tests {
     #[test]
     fn author_counter_handles_last_comma_initials() {
         assert_eq!(count_paper_authors("Shannon, C. E."), 1);
+        assert_eq!(count_paper_authors("Shannon, Claude"), 1);
+        assert_eq!(count_paper_authors("Smith, Alice"), 1);
+        assert_eq!(count_paper_authors("Shannon, Claude E."), 1);
+        assert_eq!(count_paper_authors("Shannon, Claude and Weaver, Warren"), 2);
+        assert_eq!(count_paper_authors("Shannon, Claude, Weaver, Warren"), 2);
+        assert_eq!(count_paper_authors("A. Smith, Y. Li"), 2);
+        assert_eq!(count_paper_authors("X. A, Y. B, Z. C, W. D, V. E"), 5);
+        assert_eq!(count_paper_authors("A. X, B. Y, C. Z, et al."), 4);
+        assert_eq!(count_paper_authors("Smith, Alice; Jones, Bob"), 2);
+        assert_eq!(count_paper_authors("Smith, A.; Jones, B.; Lee, C."), 3);
+        assert_eq!(count_paper_authors("A. Smith, B. Jones"), 2);
+        assert_eq!(count_paper_authors("Alice Smith, Bob Jones"), 2);
+        assert_eq!(count_paper_authors("A. B. C. Smith"), 1);
+        assert_eq!(count_paper_authors("Alice Smith and Bob Jones"), 2);
+        assert_eq!(count_paper_authors(""), 1);
+        assert_eq!(count_paper_authors("   "), 1);
         assert_eq!(count_paper_authors("C. E. Shannon, W. Weaver"), 2);
         assert_eq!(count_paper_authors("A. Vaswani, N. Shazeer, N. Parmar et al."), 4);
+    }
+
+    #[test]
+    fn author_counter_handles_particle_and_multiword_family_given_surnames() {
+        // Single particle / compound "Family, Given" authors
+        assert_eq!(count_paper_authors("de la Cruz, Juan"), 1);
+        assert_eq!(count_paper_authors("de la Cruz, Juan Carlos"), 1);
+        assert_eq!(count_paper_authors("van Rossum, Guido"), 1);
+        assert_eq!(count_paper_authors("van der Waals, Johannes D."), 1);
+        assert_eq!(count_paper_authors("von Neumann, John"), 1);
+        assert_eq!(count_paper_authors("St. Pierre, Georges"), 1);
+        assert_eq!(count_paper_authors("St. Pierre, Georges E."), 1);
+        assert_eq!(count_paper_authors("del Rio, Carlos"), 1);
+        assert_eq!(count_paper_authors("de los Santos, Maria"), 1);
+        assert_eq!(count_paper_authors("de las Casas, Bartolome"), 1);
+        assert_eq!(count_paper_authors("van den Berg, Pieter"), 1);
+        assert_eq!(count_paper_authors("van de Kamp, Peter"), 1);
+        assert_eq!(count_paper_authors("von der Leyen, Ursula"), 1);
+        assert_eq!(count_paper_authors("von dem Bussche, Axel"), 1);
+        assert_eq!(count_paper_authors("da Vinci, Leonardo"), 1);
+        assert_eq!(count_paper_authors("do Nascimento, Edson"), 1);
+        assert_eq!(count_paper_authors("dos Santos, Jose"), 1);
+        assert_eq!(count_paper_authors("das Neves, Antonio"), 1);
+        assert_eq!(count_paper_authors("di Matteo, Roberto"), 1);
+        assert_eq!(count_paper_authors("du Bois, W. E. B."), 1);
+        assert_eq!(count_paper_authors("Le Guin, Ursula K."), 1);
+        assert_eq!(count_paper_authors("La Forge, Geordi"), 1);
+        assert_eq!(count_paper_authors("San Martin, Jose"), 1);
+        assert_eq!(count_paper_authors("Santa Cruz, Alonso"), 1);
+        assert_eq!(count_paper_authors("al Khwarizmi, Muhammad"), 1);
+        assert_eq!(count_paper_authors("el Baz, Farouk"), 1);
+        assert_eq!(count_paper_authors("ben Gurion, David"), 1);
+        assert_eq!(count_paper_authors("bin Laden, Osama"), 1);
+        assert_eq!(count_paper_authors("ibn Sina, Abu"), 1);
+        assert_eq!(count_paper_authors("Abu Bakr, Abdullah"), 1);
+        assert_eq!(count_paper_authors("Mac Leod, John"), 1);
+        assert_eq!(count_paper_authors("Mc Donald, Ronald"), 1);
+        assert_eq!(count_paper_authors("ter Haar, Dirk"), 1);
+        assert_eq!(count_paper_authors("ten Kate, Jan"), 1);
+        assert_eq!(count_paper_authors("op den Velde, Jan"), 1);
+        assert_eq!(count_paper_authors("O'Connor, Mary"), 1);
+        assert_eq!(count_paper_authors("Li, Wei; Zhang, Min"), 2);
+
+        // Alternating multi-author "Family, Given" with particle surnames
+        assert_eq!(count_paper_authors("de la Cruz, Juan, O'Connor, Mary"), 2);
+        assert_eq!(count_paper_authors("van Rossum, Guido, Stroustrup, Bjarne"), 2);
+        assert_eq!(
+            count_paper_authors("van der Waals, Johannes D., von Neumann, John"),
+            2
+        );
+        assert_eq!(
+            count_paper_authors("St. Pierre, Georges, du Bois, W. E. B."),
+            2
+        );
+        assert_eq!(
+            count_paper_authors("de la Cruz, J., O'Connor, M., Stroustrup, B."),
+            3
+        );
+        assert_eq!(
+            count_paper_authors("de la Cruz, Juan, O'Connor, Mary, et al."),
+            3
+        );
+
+        // Non-regression on "Given Family" multi-author lists (including particles inside Given Family)
+        assert_eq!(count_paper_authors("A. Smith, Y. Li"), 2);
+        assert_eq!(count_paper_authors("Alice Smith, Bob Jones"), 2);
+        assert_eq!(count_paper_authors("A. Smith, B. Jones"), 2);
+        assert_eq!(count_paper_authors("X. A, Y. B, Z. C, W. D, V. E"), 5);
+        assert_eq!(count_paper_authors("A. X, B. Y, C. Z, et al."), 4);
+        assert_eq!(count_paper_authors("Juan de la Cruz, Mary O'Connor"), 2);
+        assert_eq!(count_paper_authors("Guido van Rossum, Bjarne Stroustrup"), 2);
+        assert_eq!(count_paper_authors("Ben Smith, Alice Jones"), 2);
+        assert_eq!(count_paper_authors("Al Gore, Bill Clinton"), 2);
+    }
+
+    #[test]
+    fn pop_metrics_ten_paper_cites_per_author_mean_handles_mixed_author_formats() {
+        let recs = vec![
+            mk_paper("p1", "Shannon, Claude", 2015, 18),                 // 1 author -> 18.0
+            mk_paper("p2", "Smith, Alice", 2016, 18),                    // 1 author -> 18.0
+            mk_paper("p3", "A. Smith, Y. Li", 2017, 36),                 // 2 authors -> 18.0
+            mk_paper("p4", "X. A, Y. B, Z. C, W. D, V. E", 2018, 90),    // 5 authors -> 18.0
+            mk_paper("p5", "A. X, B. Y, C. Z, et al.", 2019, 72),        // 4 authors -> 18.0
+            mk_paper("p6", "Shannon, C. E.", 2020, 18),                  // 1 author -> 18.0
+            mk_paper("p7", "Smith, Alice; Jones, Bob", 2021, 36),        // 2 authors -> 18.0
+            mk_paper("p8", "Alice Smith, Bob Jones", 2022, 36),          // 2 authors -> 18.0
+            mk_paper("p9", "Alice Smith and Bob Jones", 2023, 36),       // 2 authors -> 18.0
+            mk_paper("p10", "A. B. C. Smith", 2024, 18),                 // 1 author -> 18.0
+        ];
+        let m = compute_pop_citation_metrics_records(&recs, 2026);
+        assert_eq!(m.total_papers, 10);
+        assert!((m.cites_per_author - 18.0).abs() < 1e-9, "got {}", m.cites_per_author);
+        assert!((m.authors_per_paper - 2.1).abs() < 1e-9, "got {}", m.authors_per_paper);
+    }
+}
+
+#[cfg(test)]
+mod cd5_hits_tests {
+    use super::*;
+    use crate::models::OaStatus;
+
+    fn mk_node(id: &str, year: i32) -> PaperRecord {
+        PaperRecord {
+            id: id.to_string(),
+            title: id.to_string(),
+            authors: "A. Researcher".to_string(),
+            year,
+            venue: "Test Venue".to_string(),
+            disc: Discipline::SCI,
+            doi: String::new(),
+            arxiv_id: String::new(),
+            openalex_id: String::new(),
+            s2_id: String::new(),
+            pmcid: String::new(),
+            source_url: String::new(),
+            oa_pdf_url: String::new(),
+            oa_status: OaStatus::Unknown,
+            external_citations: None,
+            abstract_text: String::new(),
+            terms: Vec::new(),
+            concepts: Vec::new(),
+            local_pdf_path: None,
+            pdf_sha256: None,
+            pdf_bytes: None,
+            raw_references: Vec::new(),
+            retraction: Default::default(),
+            datacite_links: Vec::new(),
+            bio_entities: Vec::new(),
+        }
+    }
+
+    fn edge(src: &str, dst: &str) -> CitationEdge {
+        CitationEdge {
+            source: src.to_string(),
+            target: dst.to_string(),
+            provenance: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn disruption_cd5_respects_5yr_window_and_zero_year_edges() {
+        let papers = vec![
+            mk_node("ref_a", 2005),
+            mk_node("focal", 2010),
+            mk_node("same_yr", 2010),   // t_p excluded from CD5
+            mk_node("in_ni_1", 2011),   // t_p + 1: cites focal only -> n_i
+            mk_node("in_nj_1", 2015),   // t_p + 5: cites focal + ref_a -> n_j
+            mk_node("in_nk_1", 2013),   // t_p + 3: cites ref_a only -> n_k
+            mk_node("pre_focal", 2008), // < t_p: cites ref_a -> excluded
+            mk_node("late_ni", 2016),   // t_p + 6: cites focal only -> excluded from CD5, included in all-time CD
+            mk_node("zero_yr", 0),      // year == 0 -> CD5 == 0.0
+        ];
+        let edges = vec![
+            edge("focal", "ref_a"),
+            edge("same_yr", "focal"),
+            edge("in_ni_1", "focal"),
+            edge("in_nj_1", "focal"),
+            edge("in_nj_1", "ref_a"),
+            edge("in_nk_1", "ref_a"),
+            edge("pre_focal", "ref_a"),
+            edge("late_ni", "focal"),
+            edge("in_ni_1", "zero_yr"),
+        ];
+        let analytics = compute_corpus_analytics(&papers, &edges, &AnalyticsParams::default());
+        let focal = analytics.papers.iter().find(|p| p.record.id == "focal").unwrap();
+        // CD5: n_i = 1 (in_ni_1), n_j = 1 (in_nj_1), n_k = 1 (in_nk_1) => (1 - 1)/3 = 0.0
+        assert!((focal.disruption_cd5 - 0.0).abs() < 1e-9, "got {}", focal.disruption_cd5);
+        // All-time CD: n_i = 3 (same_yr, in_ni_1, late_ni), n_j = 1, n_k = 1 => (3 - 1)/5 = 0.4
+        assert!((focal.disruption_cd - 0.4).abs() < 1e-9, "got {}", focal.disruption_cd);
+
+        let zero = analytics.papers.iter().find(|p| p.record.id == "zero_yr").unwrap();
+        assert_eq!(zero.disruption_cd5, 0.0);
+        assert_eq!(zero.disruption_cd, 0.0);
+    }
+
+    #[test]
+    fn disruption_cd5_removes_512_citer_cap() {
+        let mut papers = Vec::new();
+        let mut edges = Vec::new();
+        papers.push(mk_node("ref_hub", 2000));
+        papers.push(mk_node("focal", 2010));
+        edges.push(edge("focal", "ref_hub"));
+
+        // 600 pre-focal citers of ref_hub (must not trigger 512 cap or hide the 600 in-window citers)
+        for k in 0..600 {
+            let id = format!("pre_{}", k);
+            papers.push(mk_node(&id, 2005));
+            edges.push(edge(&id, "ref_hub"));
+        }
+        // 600 in-window citers of ref_hub only -> n_k = 600
+        for k in 0..600 {
+            let id = format!("nk_{}", k);
+            papers.push(mk_node(&id, 2012));
+            edges.push(edge(&id, "ref_hub"));
+        }
+        // 100 in-window citers of focal only -> n_i = 100
+        for k in 0..100 {
+            let id = format!("ni_{}", k);
+            papers.push(mk_node(&id, 2014));
+            edges.push(edge(&id, "focal"));
+        }
+
+        let analytics = compute_corpus_analytics(&papers, &edges, &AnalyticsParams::default());
+        let focal = analytics.papers.iter().find(|p| p.record.id == "focal").unwrap();
+        let expected = 100.0 / 700.0;
+        assert!(
+            (focal.disruption_cd5 - expected).abs() < 1e-9,
+            "expected {}, got {}",
+            expected,
+            focal.disruption_cd5
+        );
+    }
+
+    #[test]
+    fn hits_on_dag_handles_empty_zero_edges_and_hub_authority_duality() {
+        let (h0, a0) = compute_hits_on_dag(&[], &[], 30);
+        assert!(h0.is_empty() && a0.is_empty());
+
+        let (hz, az) = compute_hits_on_dag(&[vec![], vec![]], &[vec![], vec![]], 30);
+        assert_eq!(hz, vec![0.0, 0.0]);
+        assert_eq!(az, vec![0.0, 0.0]);
+
+        // Bipartite DAG: node 0 (hub) cites 1 and 2 (authorities)
+        let papers = vec![mk_node("hub", 2022), mk_node("auth1", 2010), mk_node("auth2", 2012)];
+        let edges = vec![edge("hub", "auth1"), edge("hub", "auth2")];
+        let analytics = compute_corpus_analytics(&papers, &edges, &AnalyticsParams::default());
+        let (hh, aa) = compute_hits_on_dag(&analytics.out_adj, &analytics.in_adj, 30);
+        assert!(hh[0] > 0.99);
+        assert!(aa[1] > 0.70 && aa[2] > 0.70);
+        let h_norm: f64 = hh.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let a_norm: f64 = aa.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!((h_norm - 1.0).abs() < 1e-9);
+        assert!((a_norm - 1.0).abs() < 1e-9);
+        for (i, pm) in analytics.papers.iter().enumerate() {
+            assert!((pm.hits_hub - hh[i]).abs() < 1e-12);
+            assert!((pm.hits_authority - aa[i]).abs() < 1e-12);
+        }
     }
 }

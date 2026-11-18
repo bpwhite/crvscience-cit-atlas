@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
-use cit_atlas::analytics::compute_corpus_analytics;
+use cit_atlas::analytics::{compute_corpus_analytics, compute_hits_on_dag};
 use cit_atlas::corpus::build_empirical_corpus;
 use cit_atlas::export::{
     csv_escape, export_gexf, export_graphml, export_raw_papers_csv, format_bibtex_corpus,
@@ -25,7 +25,8 @@ use cit_atlas::models::{
 use cit_atlas::rate_limiter::{AcquirePermit, CrawlAuditOutcome, DomainRateLimiter};
 use cit_atlas::search_providers::{merge_and_link_records, normalize_doi};
 use cit_atlas::storage::{
-    parse_bibtex_text, parse_corpus_csv, parse_gexf_corpus, parse_graphml_corpus, LedgerStore,
+    import_corpus_file, parse_bibtex_text, parse_corpus_csv, parse_csl_json_text,
+    parse_gexf_corpus, parse_graphml_corpus, parse_nbib_text, parse_ris_text, LedgerStore,
 };
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
@@ -207,48 +208,6 @@ fn blank_paper(id: &str, title: &str, authors: &str, year: i32, venue: &str) -> 
         datacite_links: Vec::new(),
         bio_entities: Vec::new(),
     }
-}
-
-/// Deterministic HITS Hub & Authority power iteration on the actual `CorpusAnalytics` citation DAG (`out_adj` / `in_adj`).
-fn compute_hits_on_dag(out_adj: &[Vec<usize>], in_adj: &[Vec<usize>], iters: usize) -> (Vec<f64>, Vec<f64>) {
-    let n = out_adj.len();
-    if n == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    let mut hub = vec![1.0 / (n as f64).sqrt(); n];
-    let mut auth = vec![1.0 / (n as f64).sqrt(); n];
-
-    for _ in 0..iters {
-        let mut next_auth = vec![0.0_f64; n];
-        for (v, citers) in in_adj.iter().enumerate() {
-            let mut sum = 0.0;
-            for &u in citers {
-                sum += hub[u];
-            }
-            next_auth[v] = sum;
-        }
-        let norm_a = next_auth.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
-        for x in &mut next_auth {
-            *x /= norm_a;
-        }
-
-        let mut next_hub = vec![0.0_f64; n];
-        for (u, refs) in out_adj.iter().enumerate() {
-            let mut sum = 0.0;
-            for &v in refs {
-                sum += next_auth[v];
-            }
-            next_hub[u] = sum;
-        }
-        let norm_h = next_hub.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
-        for x in &mut next_hub {
-            *x /= norm_h;
-        }
-
-        auth = next_auth;
-        hub = next_hub;
-    }
-    (hub, auth)
 }
 
 #[test]
@@ -448,6 +407,24 @@ fn t2_citation_dag_scientometrics_and_louvain_clustering() {
     let mut highlights_src: Vec<(usize, &cit_atlas::models::PaperMetrics)> =
         analytics.papers.iter().enumerate().collect();
     for (i, pm) in &highlights_src {
+        assert!(
+            (pm.hits_hub - hits_hub[*i]).abs() < 1e-6,
+            "PaperMetrics.hits_hub ({}) must match compute_hits_on_dag ({})",
+            pm.hits_hub,
+            hits_hub[*i]
+        );
+        assert!(
+            (pm.hits_authority - hits_auth[*i]).abs() < 1e-6,
+            "PaperMetrics.hits_authority ({}) must match compute_hits_on_dag ({})",
+            pm.hits_authority,
+            hits_auth[*i]
+        );
+        assert!(
+            pm.disruption_cd5 >= -1.0 && pm.disruption_cd5 <= 1.0,
+            "disruption_cd5 ({}) out of [-1.0, 1.0] for {}",
+            pm.disruption_cd5,
+            pm.record.id
+        );
         csv_lines.push(format!(
             "{},{},{},{},{},{},{},{:.8},{:.8},{:.8},{:.6},{},{},{:.6},{:.6},{:.6},{:.6},{:.4}",
             csv_escape(&pm.record.id),
@@ -712,6 +689,64 @@ fn t3_doi_title_deduplication_and_format_roundtrip_fidelity() {
     assert_eq!(db_papers.len(), merged.len());
     assert_eq!(db_edges.len(), hydrated_edges.len());
 
+    // 4. Native RIS, PubMed NBIB & CSL-JSON Import Roundtrip Fidelity
+    let ris_sample = "\
+TY  - JOUR
+ID  - shannon1948
+TI  - A Mathematical Theory of Communication
+AU  - Shannon, Claude E.
+PY  - 1948
+JF  - Bell System Technical Journal
+DO  - 10.1002/j.1538-7305.1948.tb01338.x
+AB  - Foundational theory of entropy and channel capacity.
+ER  -
+";
+    let ris_path = tmp_dir.join("sample.ris");
+    std::fs::write(&ris_path, ris_sample).expect("write RIS");
+    let (ris_papers, _) = import_corpus_file(&ris_path).expect("import RIS");
+    assert_eq!(ris_papers.len(), 1);
+    assert_eq!(ris_papers[0].doi, "10.1002/j.1538-7305.1948.tb01338.x");
+    assert_eq!(ris_papers[0].year, 1948);
+    assert_eq!(parse_ris_text(ris_sample).len(), 1);
+
+    let nbib_sample = "\
+PMID- 34265844
+TI  - Highly accurate protein structure prediction with AlphaFold
+FAU - Jumper, John
+FAU - Hassabis, Demis
+DP  - 2021 Jul
+JT  - Nature
+LID - 10.1038/s41586-021-03819-2 [doi]
+AID - PMC8371605 [pmc]
+AB  - Atomic-accuracy neural structure prediction.
+";
+    let nbib_path = tmp_dir.join("sample.nbib");
+    std::fs::write(&nbib_path, nbib_sample).expect("write NBIB");
+    let (nbib_papers, _) = import_corpus_file(&nbib_path).expect("import NBIB");
+    assert_eq!(nbib_papers.len(), 1);
+    assert_eq!(nbib_papers[0].doi, "10.1038/s41586-021-03819-2");
+    assert_eq!(nbib_papers[0].pmcid, "PMC8371605");
+    assert_eq!(parse_nbib_text(nbib_sample).len(), 1);
+
+    let csl_sample = r#"[
+  {
+    "id": "wu2019",
+    "type": "article-journal",
+    "title": "Large teams develop and small teams disrupt science and technology",
+    "author": [{"given": "Lingfei", "family": "Wu"}, {"given": "James A.", "family": "Evans"}],
+    "issued": {"date-parts": [[2019, 2]]},
+    "container-title": "Nature",
+    "DOI": "10.1038/s41586-019-0941-9"
+  }
+]"#;
+    let csl_path = tmp_dir.join("sample_csl.json");
+    std::fs::write(&csl_path, csl_sample).expect("write CSL-JSON");
+    let (csl_papers, _) = import_corpus_file(&csl_path).expect("import CSL-JSON via .json");
+    assert_eq!(csl_papers.len(), 1);
+    assert_eq!(csl_papers[0].doi, "10.1038/s41586-019-0941-9");
+    assert_eq!(csl_papers[0].year, 2019);
+    assert_eq!(parse_csl_json_text(csl_sample).expect("parse CSL-JSON").len(), 1);
+
     drop(store);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
@@ -726,7 +761,7 @@ fn t3_doi_title_deduplication_and_format_roundtrip_fidelity() {
         abstract_enrichment_verified: true,
         bibtex_roundtrip_count: bib_parsed.len(),
         bibtex_doi_exact_matches: bib_exact_dois,
-        ris_native_supported: false,
+        ris_native_supported: true,
         graphml_roundtrip_nodes: gml_papers.len(),
         graphml_roundtrip_edges: gml_edges.len(),
         gexf_roundtrip_nodes: gexf_papers.len(),

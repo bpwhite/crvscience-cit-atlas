@@ -495,12 +495,35 @@ pub fn import_corpus_file(path: &Path) -> Result<(Vec<PaperRecord>, Vec<Citation
             #[serde(default)]
             edges: Vec<CitationEdge>,
         }
-        let bundle: JsonBundle =
-            serde_json::from_str(&text).map_err(|e| format!("Invalid corpus JSON: {}", e))?;
-        if bundle.papers.is_empty() {
+        if let Ok(bundle) = serde_json::from_str::<JsonBundle>(&text) {
+            if !bundle.papers.is_empty() {
+                return Ok((bundle.papers, bundle.edges));
+            }
+        }
+        let csl_papers = parse_csl_json_text(&text)
+            .map_err(|e| format!("Invalid corpus JSON / CSL-JSON: {}", e))?;
+        if csl_papers.is_empty() {
             return Err("JSON file contains 0 papers".to_string());
         }
-        Ok((bundle.papers, bundle.edges))
+        Ok((csl_papers, Vec::new()))
+    } else if ext == "csl" || ext == "csljson" {
+        let papers = parse_csl_json_text(&text)?;
+        if papers.is_empty() {
+            return Err("No valid CSL-JSON bibliography items found".to_string());
+        }
+        Ok((papers, Vec::new()))
+    } else if ext == "ris" {
+        let papers = parse_ris_text(&text);
+        if papers.is_empty() {
+            return Err("No valid RIS reference records found".to_string());
+        }
+        Ok((papers, Vec::new()))
+    } else if ext == "nbib" || ext == "medline" {
+        let papers = parse_nbib_text(&text);
+        if papers.is_empty() {
+            return Err("No valid PubMed NBIB / MEDLINE records found".to_string());
+        }
+        Ok((papers, Vec::new()))
     } else if ext == "csv" {
         let (papers, mut edges) = parse_corpus_csv(&text)?;
         if edges.is_empty() {
@@ -931,7 +954,7 @@ pub fn parse_bibtex_text(text: &str) -> Vec<PaperRecord> {
             if a.is_empty() {
                 "BibTeX Author".to_string()
             } else {
-                a.replace(" and ", ", ")
+                normalize_bibtex_authors(&a)
             }
         };
         let year = extract_bib_field(body, "year")
@@ -1300,4 +1323,764 @@ pub fn parse_gexf_corpus(xml: &str) -> Result<(Vec<PaperRecord>, Vec<CitationEdg
     }
 
     Ok((papers, edges))
+}
+
+fn normalize_bibtex_authors(raw: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for tok in raw.split_whitespace() {
+        if tok.eq_ignore_ascii_case("and") {
+            if !current.is_empty() {
+                parts.push(current.join(" "));
+                current.clear();
+            }
+        } else {
+            current.push(tok);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current.join(" "));
+    }
+
+    let mut normalized: Vec<String> = Vec::new();
+    for part in parts {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p.eq_ignore_ascii_case("others") {
+            normalized.push("et al.".to_string());
+        } else if p.matches(',').count() == 1 {
+            let is_two_initial_last_pairs = if let Some((left, right)) = p.split_once(',') {
+                left.split_whitespace().next().is_some_and(|t| {
+                    t.ends_with('.')
+                        && t.chars().count() <= 3
+                        && !t.eq_ignore_ascii_case("st.")
+                        && !t.eq_ignore_ascii_case("ste.")
+                }) && right.split_whitespace().count() >= 2
+            } else {
+                false
+            };
+            if is_two_initial_last_pairs {
+                normalized.push(p.to_string());
+            } else {
+                let n = normalize_person_name(p);
+                if !n.is_empty() {
+                    normalized.push(n);
+                }
+            }
+        } else if p.matches(',').count() == 0 {
+            let n = normalize_person_name(p);
+            if !n.is_empty() {
+                normalized.push(n);
+            }
+        } else {
+            normalized.push(p.to_string());
+        }
+    }
+
+    if normalized.is_empty() {
+        "BibTeX Author".to_string()
+    } else {
+        normalized.join(", ")
+    }
+}
+
+fn normalize_person_name(raw: &str) -> String {
+    let clean = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        return String::new();
+    }
+    if let Some((family, given)) = clean.split_once(',') {
+        let fam = family.trim();
+        let giv = given.trim();
+        if !fam.is_empty() && !giv.is_empty() {
+            return format!("{} {}", giv, fam);
+        }
+        if !fam.is_empty() {
+            return fam.to_string();
+        }
+    }
+    clean
+}
+
+fn strip_simple_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Parses RIS (`TY  - ...` / `ER  -`) bibliographic reference files into `PaperRecord` entries.
+pub fn parse_ris_text(text: &str) -> Vec<PaperRecord> {
+    let cleaned = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut records: Vec<HashMap<String, Vec<String>>> = Vec::new();
+    let mut current: HashMap<String, Vec<String>> = HashMap::new();
+    let mut last_tag: Option<String> = None;
+
+    for raw_line in cleaned.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let bytes = line.as_bytes();
+        let is_tag = bytes.len() >= 6
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes[1].is_ascii_alphanumeric()
+            && &bytes[2..6] == b"  - ";
+        let is_tag_short = !is_tag
+            && bytes.len() >= 5
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes[1].is_ascii_alphanumeric()
+            && &bytes[2..5] == b"  -";
+
+        if is_tag || is_tag_short {
+            let tag = line[..2].to_ascii_uppercase();
+            let val = if is_tag { &line[6..] } else { &line[5..] }.trim();
+            if tag == "ER" {
+                if !current.is_empty() {
+                    records.push(std::mem::take(&mut current));
+                }
+                last_tag = None;
+                continue;
+            }
+            if tag == "TY" && !current.is_empty() {
+                records.push(std::mem::take(&mut current));
+            }
+            if !val.is_empty() {
+                current.entry(tag.clone()).or_default().push(val.to_string());
+            }
+            last_tag = Some(tag);
+        } else if !line.trim().is_empty() {
+            if let Some(ref tag) = last_tag {
+                if let Some(vec) = current.get_mut(tag) {
+                    if let Some(last) = vec.last_mut() {
+                        if !last.is_empty() {
+                            last.push(' ');
+                        }
+                        last.push_str(line.trim());
+                    }
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        records.push(current);
+    }
+
+    let first_tag = |map: &HashMap<String, Vec<String>>, tags: &[&str]| -> String {
+        for t in tags {
+            if let Some(vals) = map.get(*t) {
+                if let Some(v) = vals.iter().find(|s| !s.trim().is_empty()) {
+                    return v.trim().to_string();
+                }
+            }
+        }
+        String::new()
+    };
+
+    let mut out = Vec::new();
+    for (idx, map) in records.iter().enumerate() {
+        let title = first_tag(map, &["TI", "T1", "CT"]);
+        if title.is_empty() {
+            continue;
+        }
+        let mut author_list: Vec<String> = Vec::new();
+        for tag in ["AU", "A1", "A2"] {
+            if let Some(vals) = map.get(tag) {
+                for v in vals {
+                    let norm = normalize_person_name(v);
+                    if !norm.is_empty() && !author_list.contains(&norm) {
+                        author_list.push(norm);
+                    }
+                }
+                if !author_list.is_empty() {
+                    break;
+                }
+            }
+        }
+        let authors = if author_list.is_empty() {
+            "RIS Author".to_string()
+        } else {
+            author_list.join(", ")
+        };
+
+        let year_str = first_tag(map, &["PY", "Y1", "DA"]);
+        let year = extract_year_from_str(&year_str).unwrap_or(2020);
+        let venue = {
+            let v = first_tag(map, &["JF", "JO", "T2", "JA", "BT"]);
+            if v.is_empty() {
+                "RIS Imported Venue".to_string()
+            } else {
+                v
+            }
+        };
+        let doi = normalize_doi(&first_tag(map, &["DO", "DI"]));
+        let abstract_text = first_tag(map, &["AB", "N2"]);
+        let url = first_tag(map, &["UR"]);
+        let pdf_url = first_tag(map, &["L1"]);
+        let mut kw_terms: Vec<String> = map
+            .get("KW")
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|s| {
+                s.split([';', ','])
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let combined = format!("{} {} {} {}", title, venue, abstract_text, kw_terms.join(" "));
+        let disc = Discipline::infer_from_text(&combined);
+        let concepts = infer_concepts_from_text(&combined, disc);
+        if kw_terms.is_empty() {
+            kw_terms = concepts.clone();
+        }
+        let raw_id = first_tag(map, &["ID", "AN"]);
+        let id = if !raw_id.is_empty() {
+            raw_id
+        } else if !doi.is_empty() {
+            format!("ris_{}", doi.replace(['/', ':'], "_"))
+        } else {
+            format!("ris_{}_{}", year, idx + 1)
+        };
+
+        out.push(PaperRecord {
+            id,
+            title,
+            authors,
+            year,
+            venue,
+            disc,
+            source_url: if !url.is_empty() {
+                url
+            } else if !doi.is_empty() {
+                format!("https://doi.org/{}", doi)
+            } else {
+                String::new()
+            },
+            doi,
+            arxiv_id: String::new(),
+            openalex_id: String::new(),
+            s2_id: String::new(),
+            pmcid: String::new(),
+            oa_pdf_url: pdf_url,
+            oa_status: OaStatus::Unknown,
+            external_citations: None,
+            abstract_text,
+            terms: kw_terms,
+            concepts,
+            local_pdf_path: None,
+            pdf_sha256: None,
+            pdf_bytes: None,
+            raw_references: Vec::new(),
+            retraction: RetractionRecord::default(),
+            datacite_links: Vec::new(),
+            bio_entities: Vec::new(),
+        });
+    }
+    out
+}
+
+/// Parses PubMed NBIB / MEDLINE (`PMID- ...`, `TI  - ...`, `FAU - ...`) export files into `PaperRecord` entries.
+pub fn parse_nbib_text(text: &str) -> Vec<PaperRecord> {
+    let cleaned = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut blocks: Vec<HashMap<String, Vec<String>>> = Vec::new();
+    let mut current: HashMap<String, Vec<String>> = HashMap::new();
+    let mut last_tag: Option<String> = None;
+
+    for raw_line in cleaned.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                blocks.push(std::mem::take(&mut current));
+            }
+            last_tag = None;
+            continue;
+        }
+        if line.starts_with("      ") || line.starts_with('\t') {
+            if let Some(ref tag) = last_tag {
+                if let Some(vec) = current.get_mut(tag) {
+                    if let Some(last) = vec.last_mut() {
+                        if !last.is_empty() {
+                            last.push(' ');
+                        }
+                        last.push_str(line.trim());
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(dash_pos) = line.find('-') {
+            let tag_raw = &line[..dash_pos];
+            let tag = tag_raw.trim();
+            if (2..=4).contains(&tag.len())
+                && tag.chars().all(|c| c.is_ascii_alphanumeric())
+                && (dash_pos == 4 || line[dash_pos..].starts_with("- "))
+            {
+                let tag_up = tag.to_ascii_uppercase();
+                let val = line[dash_pos + 1..].trim();
+                if tag_up == "PMID" && !current.is_empty() {
+                    blocks.push(std::mem::take(&mut current));
+                }
+                if !val.is_empty() {
+                    current
+                        .entry(tag_up.clone())
+                        .or_default()
+                        .push(val.to_string());
+                }
+                last_tag = Some(tag_up);
+            }
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+
+    let first_tag = |map: &HashMap<String, Vec<String>>, tags: &[&str]| -> String {
+        for t in tags {
+            if let Some(vals) = map.get(*t) {
+                if let Some(v) = vals.iter().find(|s| !s.trim().is_empty()) {
+                    return v.trim().to_string();
+                }
+            }
+        }
+        String::new()
+    };
+
+    let mut out = Vec::new();
+    for (idx, map) in blocks.iter().enumerate() {
+        let title = first_tag(map, &["TI", "BTI"])
+            .trim_end_matches('.')
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let pmid = first_tag(map, &["PMID"]);
+        let mut authors_vec: Vec<String> = Vec::new();
+        if let Some(fau_list) = map.get("FAU") {
+            for a in fau_list {
+                let norm = normalize_person_name(a);
+                if !norm.is_empty() {
+                    authors_vec.push(norm);
+                }
+            }
+        } else if let Some(au_list) = map.get("AU") {
+            for a in au_list {
+                let t = a.trim();
+                if !t.is_empty() {
+                    authors_vec.push(t.to_string());
+                }
+            }
+        }
+        let authors = if authors_vec.is_empty() {
+            "PubMed Author".to_string()
+        } else {
+            authors_vec.join(", ")
+        };
+
+        let dp = first_tag(map, &["DP"]);
+        let year = extract_year_from_str(&dp).unwrap_or(2020);
+        let venue = {
+            let v = first_tag(map, &["JT", "TA"]);
+            if v.is_empty() {
+                "PubMed / MEDLINE".to_string()
+            } else {
+                v
+            }
+        };
+
+        let mut doi = String::new();
+        let mut pmcid = first_tag(map, &["PMC"]);
+        for tag in ["LID", "AID"] {
+            if let Some(vals) = map.get(tag) {
+                for v in vals {
+                    let low = v.to_ascii_lowercase();
+                    if doi.is_empty() && low.contains("[doi]") {
+                        let raw_d = v.split("[doi]").next().unwrap_or("").trim();
+                        doi = normalize_doi(raw_d);
+                    } else if pmcid.is_empty() && low.contains("[pmc]") {
+                        let raw_p = v.split("[pmc]").next().unwrap_or("").trim();
+                        if !raw_p.is_empty() {
+                            pmcid = raw_p.to_ascii_uppercase();
+                        }
+                    }
+                }
+            }
+        }
+        let oa_pdf_url = if !pmcid.is_empty() {
+            format!("https://pmc.ncbi.nlm.nih.gov/articles/{}/pdf/", pmcid)
+        } else {
+            String::new()
+        };
+        let oa_status = if !pmcid.is_empty() {
+            OaStatus::Green
+        } else {
+            OaStatus::Unknown
+        };
+        let abstract_text = first_tag(map, &["AB"]);
+        let mut terms: Vec<String> = Vec::new();
+        if !pmid.is_empty() {
+            terms.push(format!("pmid:{}", pmid));
+        }
+        for tag in ["OT", "MH"] {
+            if let Some(vals) = map.get(tag) {
+                for v in vals {
+                    let clean_kw = v.trim_start_matches('*').trim();
+                    if !clean_kw.is_empty() && !terms.contains(&clean_kw.to_string()) {
+                        terms.push(clean_kw.to_string());
+                    }
+                }
+            }
+        }
+
+        let combined = format!("{} {} {} {}", title, venue, abstract_text, terms.join(" "));
+        let disc = Discipline::infer_from_text(&combined);
+        let concepts = infer_concepts_from_text(&combined, disc);
+        if terms.is_empty() {
+            terms = concepts.clone();
+        }
+        let id = if !pmid.is_empty() {
+            format!("pmid_{}", pmid)
+        } else {
+            format!("nbib_{}_{}", year, idx + 1)
+        };
+        let source_url = if !pmid.is_empty() {
+            format!("https://pubmed.ncbi.nlm.nih.gov/{}/", pmid)
+        } else if !doi.is_empty() {
+            format!("https://doi.org/{}", doi)
+        } else {
+            String::new()
+        };
+
+        out.push(PaperRecord {
+            id,
+            title,
+            authors,
+            year,
+            venue,
+            disc,
+            doi,
+            arxiv_id: String::new(),
+            openalex_id: String::new(),
+            s2_id: String::new(),
+            pmcid,
+            source_url,
+            oa_pdf_url,
+            oa_status,
+            external_citations: None,
+            abstract_text,
+            terms,
+            concepts,
+            local_pdf_path: None,
+            pdf_sha256: None,
+            pdf_bytes: None,
+            raw_references: Vec::new(),
+            retraction: RetractionRecord::default(),
+            datacite_links: Vec::new(),
+            bio_entities: Vec::new(),
+        });
+    }
+    out
+}
+
+/// Parses CSL-JSON (`[...]` or `{"items": [...]}`) reference exports into `PaperRecord` entries.
+pub fn parse_csl_json_text(text: &str) -> Result<Vec<PaperRecord>, String> {
+    let cleaned = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let root: serde_json::Value =
+        serde_json::from_str(cleaned).map_err(|e| format!("Invalid CSL-JSON syntax: {}", e))?;
+    let items: &[serde_json::Value] = if let Some(arr) = root.as_array() {
+        arr
+    } else if let Some(arr) = root.get("items").and_then(|v| v.as_array()) {
+        arr
+    } else {
+        return Err("CSL-JSON must be a JSON array or an object containing an 'items' array".to_string());
+    };
+
+    let mut out = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let Some(obj) = item.as_object() else { continue };
+        let title_raw = obj
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let title = strip_simple_html_tags(title_raw);
+        if title.is_empty() {
+            continue;
+        }
+
+        let mut authors_vec: Vec<String> = Vec::new();
+        if let Some(arr) = obj.get("author").and_then(|v| v.as_array()) {
+            for a in arr {
+                if let Some(lit) = a.get("literal").and_then(|v| v.as_str()) {
+                    let norm = normalize_person_name(lit);
+                    if !norm.is_empty() {
+                        authors_vec.push(norm);
+                    }
+                } else {
+                    let given = a.get("given").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let family = a.get("family").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let full = format!("{} {}", given, family).trim().to_string();
+                    if !full.is_empty() {
+                        authors_vec.push(full);
+                    }
+                }
+            }
+        }
+        let authors = if authors_vec.is_empty() {
+            "CSL-JSON Author".to_string()
+        } else {
+            authors_vec.join(", ")
+        };
+
+        let year = obj
+            .get("issued")
+            .and_then(|iss| {
+                iss.get("date-parts")
+                    .and_then(|dp| dp.as_array())
+                    .and_then(|outer| outer.first())
+                    .and_then(|inner| inner.as_array())
+                    .and_then(|parts| parts.first())
+                    .and_then(|y| {
+                        y.as_i64()
+                            .map(|n| n as i32)
+                            .or_else(|| y.as_str().and_then(extract_year_from_str))
+                    })
+                    .or_else(|| {
+                        iss.get("raw")
+                            .and_then(|r| r.as_str())
+                            .and_then(extract_year_from_str)
+                    })
+            })
+            .or_else(|| {
+                obj.get("year")
+                    .and_then(|y| y.as_i64().map(|n| n as i32))
+            })
+            .unwrap_or(2020);
+
+        let venue = obj
+            .get("container-title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("CSL-JSON Imported Venue")
+            .trim()
+            .to_string();
+
+        let doi_raw = obj
+            .get("DOI")
+            .or_else(|| obj.get("doi"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let doi = normalize_doi(doi_raw);
+        let url = obj
+            .get("URL")
+            .or_else(|| obj.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let abstract_text = strip_simple_html_tags(
+            obj.get("abstract")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
+
+        let mut terms: Vec<String> = Vec::new();
+        if let Some(kw) = obj.get("keyword").and_then(|v| v.as_str()) {
+            for part in kw.split([',', ';']).map(str::trim).filter(|s| !s.is_empty()) {
+                terms.push(part.to_string());
+            }
+        }
+        if let Some(cats) = obj.get("categories").and_then(|v| v.as_array()) {
+            for c in cats {
+                if let Some(s) = c.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    if !terms.contains(&s.to_string()) {
+                        terms.push(s.to_string());
+                    }
+                }
+            }
+        }
+
+        let combined = format!("{} {} {} {}", title, venue, abstract_text, terms.join(" "));
+        let disc = Discipline::infer_from_text(&combined);
+        let concepts = infer_concepts_from_text(&combined, disc);
+        if terms.is_empty() {
+            terms = concepts.clone();
+        }
+
+        let raw_id = obj
+            .get("id")
+            .or_else(|| obj.get("citation-key"))
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_i64().map(|n| n.to_string())))
+            .unwrap_or_default();
+        let id = if !raw_id.trim().is_empty() {
+            raw_id.trim().to_string()
+        } else if !doi.is_empty() {
+            format!("csl_{}", doi.replace(['/', ':'], "_"))
+        } else {
+            format!("csl_{}_{}", year, idx + 1)
+        };
+
+        out.push(PaperRecord {
+            id,
+            title,
+            authors,
+            year,
+            venue,
+            disc,
+            source_url: if !url.is_empty() {
+                url
+            } else if !doi.is_empty() {
+                format!("https://doi.org/{}", doi)
+            } else {
+                String::new()
+            },
+            doi,
+            arxiv_id: String::new(),
+            openalex_id: String::new(),
+            s2_id: String::new(),
+            pmcid: String::new(),
+            oa_pdf_url: String::new(),
+            oa_status: OaStatus::Unknown,
+            external_citations: None,
+            abstract_text,
+            terms,
+            concepts,
+            local_pdf_path: None,
+            pdf_sha256: None,
+            pdf_bytes: None,
+            raw_references: Vec::new(),
+            retraction: RetractionRecord::default(),
+            datacite_links: Vec::new(),
+            bio_entities: Vec::new(),
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    #[test]
+    fn ris_import_parses_multirecord_authors_doi_abstract_and_file() {
+        let ris = "\u{feff}TY  - JOUR\r\nID  - shannon1948\r\nTI  - A Mathematical Theory of Communication\r\nAU  - Shannon, Claude E.\r\nAU  - Weaver, Warren\r\nPY  - 1948/07//\r\nJF  - Bell System Technical Journal\r\nDO  - 10.1002/j.1538-7305.1948.tb01338.x\r\nAB  - The fundamental problem of communication is that of\r\n  reproducing at one point either exactly or approximately a message.\r\nKW  - entropy; channel capacity\r\nER  -\r\n\r\nTY  - JOUR\r\nTI  - Deep Residual Learning\r\nAU  - He, Kaiming\r\nPY  - 2016\r\nJO  - CVPR\r\nDO  - https://doi.org/10.1109/CVPR.2016.90\r\nER  -\r\n";
+        let parsed = parse_ris_text(ris);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "shannon1948");
+        assert_eq!(parsed[0].year, 1948);
+        assert_eq!(parsed[0].authors, "Claude E. Shannon, Warren Weaver");
+        assert_eq!(parsed[0].doi, "10.1002/j.1538-7305.1948.tb01338.x");
+        assert!(parsed[0].abstract_text.contains("reproducing at one point"));
+        assert_eq!(parsed[1].year, 2016);
+        assert_eq!(parsed[1].authors, "Kaiming He");
+
+        let tmp = std::env::temp_dir().join(format!("cit_atlas_test_{}.ris", std::process::id()));
+        std::fs::write(&tmp, ris).unwrap();
+        let (papers, edges) = import_corpus_file(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(papers.len(), 2);
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn nbib_import_parses_pubmed_multiline_fau_lid_doi_pmc_and_file() {
+        let nbib = "\u{feff}PMID- 34265844\r\nOWN - NLM\r\nTI  - Highly accurate protein structure prediction with\r\n      AlphaFold.\r\nFAU - Jumper, John\r\nAU  - Jumper J\r\nFAU - Hassabis, Demis\r\nAU  - Hassabis D\r\nDP  - 2021 Aug\r\nJT  - Nature\r\nTA  - Nature\r\nLID - 10.1038/s41586-021-03819-2 [doi]\r\nAID - PMC8371605 [pmc]\r\nAB  - Proteins are essential to life, and understanding their structure\r\n      can facilitate a mechanistic understanding of their function.\r\nOT  - AlphaFold\r\nMH  - *Protein Folding\r\n\r\nPMID- 12345678\r\nTI  - Second MEDLINE Paper\r\nAU  - Smith A\r\nDP  - 2019\r\nTA  - Bioinformatics\r\n";
+        let parsed = parse_nbib_text(nbib);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "pmid_34265844");
+        assert_eq!(parsed[0].year, 2021);
+        assert_eq!(parsed[0].authors, "John Jumper, Demis Hassabis");
+        assert_eq!(parsed[0].doi, "10.1038/s41586-021-03819-2");
+        assert_eq!(parsed[0].pmcid, "PMC8371605");
+        assert_eq!(parsed[0].oa_status, OaStatus::Green);
+        assert!(parsed[0].terms.contains(&"pmid:34265844".to_string()));
+        assert!(parsed[0].abstract_text.contains("mechanistic understanding"));
+        assert_eq!(parsed[1].id, "pmid_12345678");
+        assert_eq!(parsed[1].authors, "Smith A");
+
+        let tmp = std::env::temp_dir().join(format!("cit_atlas_test_{}.nbib", std::process::id()));
+        std::fs::write(&tmp, nbib).unwrap();
+        let (papers, _) = import_corpus_file(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(papers.len(), 2);
+    }
+
+    #[test]
+    fn csl_json_import_handles_array_and_items_wrapper_and_json_ext() {
+        let csl_arr = r#"[
+          {
+            "id": "wu2019",
+            "title": "Large teams develop and <i>small</i> teams disrupt science and technology",
+            "author": [{"given": "Lingfei", "family": "Wu"}, {"given": "James A.", "family": "Evans"}],
+            "issued": {"date-parts": [[2019, 2]]},
+            "container-title": "Nature",
+            "DOI": "10.1038/s41586-019-0941-9",
+            "keyword": "disruption, scientometrics"
+          }
+        ]"#;
+        let parsed_arr = parse_csl_json_text(csl_arr).unwrap();
+        assert_eq!(parsed_arr.len(), 1);
+        assert_eq!(parsed_arr[0].id, "wu2019");
+        assert_eq!(parsed_arr[0].year, 2019);
+        assert_eq!(parsed_arr[0].title, "Large teams develop and small teams disrupt science and technology");
+        assert_eq!(parsed_arr[0].authors, "Lingfei Wu, James A. Evans");
+
+        let csl_wrapped = format!(r#"{{"items": {}}}"#, csl_arr);
+        let tmp_json = std::env::temp_dir().join(format!("cit_atlas_csl_{}.json", std::process::id()));
+        std::fs::write(&tmp_json, &csl_wrapped).unwrap();
+        let (p_json, _) = import_corpus_file(&tmp_json).unwrap();
+        let _ = std::fs::remove_file(&tmp_json);
+        assert_eq!(p_json.len(), 1);
+        assert_eq!(p_json[0].doi, "10.1038/s41586-019-0941-9");
+
+        let tmp_csl = std::env::temp_dir().join(format!("cit_atlas_csl_{}.csl", std::process::id()));
+        std::fs::write(&tmp_csl, csl_arr).unwrap();
+        let (p_csl, _) = import_corpus_file(&tmp_csl).unwrap();
+        let _ = std::fs::remove_file(&tmp_csl);
+        assert_eq!(p_csl.len(), 1);
+    }
+
+    #[test]
+    fn bibtex_import_normalizes_family_given_authors() {
+        let bib = r#"
+@article{shannon1948,
+  title = {A Mathematical Theory of Communication},
+  author = {Shannon, Claude E. and Weaver, Warren},
+  year = {1948},
+  journal = {Bell System Technical Journal},
+  doi = {10.1002/j.1538-7305.1948.tb01338.x}
+}
+
+@article{smith2020,
+  title = {Single Author Study},
+  author = {Smith, Alice},
+  year = {2020},
+  journal = {Journal of Testing}
+}
+
+@article{stpierre2021,
+  title = {Particle Surname Study},
+  author = {St. Pierre, Georges E. and de la Cruz, Juan},
+  year = {2021},
+  journal = {Journal of Particles}
+}
+"#;
+        let parsed = parse_bibtex_text(bib);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].authors, "Claude E. Shannon, Warren Weaver");
+        assert_eq!(parsed[1].authors, "Alice Smith");
+        assert_eq!(parsed[2].authors, "Georges E. St. Pierre, Juan de la Cruz");
+        assert_eq!(crate::analytics::count_paper_authors(&parsed[0].authors), 2);
+        assert_eq!(crate::analytics::count_paper_authors(&parsed[1].authors), 1);
+        assert_eq!(crate::analytics::count_paper_authors(&parsed[2].authors), 2);
+    }
 }

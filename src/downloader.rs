@@ -182,7 +182,22 @@ pub fn download_single_paper_pdf(
     paper: &mut PaperRecord,
     pdf_dir: &Path,
 ) -> DownloadItemReport {
-    let _ = fs::create_dir_all(pdf_dir);
+    if let Err(e) = fs::create_dir_all(pdf_dir) {
+        return DownloadItemReport {
+            paper_id: paper.id.clone(),
+            title: paper.title.clone(),
+            doi: paper.doi.clone(),
+            status: DownloadStatus::FailedNetwork(format!(
+                "Could not create PDF directory {:?}: {}",
+                pdf_dir, e
+            )),
+            resolved_stage: "local_disk_cache".to_string(),
+            final_pdf_url: String::new(),
+            saved_path: None,
+            byte_len: 0,
+            sha256: None,
+        };
+    }
     let target_name = build_safe_pdf_filename(paper);
     let target_path: PathBuf = pdf_dir.join(&target_name);
 
@@ -426,14 +441,20 @@ pub fn batch_download_corpus_pdfs(
 
     // Write BibTeX sidecar & Markdown/JSON audit manifests
     let bib_content = format_bibtex_corpus(papers);
-    let _ = fs::write(out_dir.join("corpus_references.bib"), bib_content);
+    let bib_path = out_dir.join("corpus_references.bib");
+    fs::write(&bib_path, bib_content)
+        .map_err(|e| format!("Failed writing BibTeX manifest {:?}: {}", bib_path, e))?;
 
-    if let Ok(manifest_json) = serde_json::to_string_pretty(&reports) {
-        let _ = fs::write(out_dir.join("download_manifest.json"), manifest_json);
-    }
+    let manifest_json = serde_json::to_string_pretty(&reports)
+        .map_err(|e| format!("Failed serializing download manifest JSON: {}", e))?;
+    let manifest_path = out_dir.join("download_manifest.json");
+    fs::write(&manifest_path, manifest_json)
+        .map_err(|e| format!("Failed writing download manifest {:?}: {}", manifest_path, e))?;
 
     let md_report = format_markdown_download_report(&reports);
-    let _ = fs::write(out_dir.join("download_report.md"), md_report);
+    let md_path = out_dir.join("download_report.md");
+    fs::write(&md_path, md_report)
+        .map_err(|e| format!("Failed writing download report {:?}: {}", md_path, e))?;
 
     Ok(reports)
 }

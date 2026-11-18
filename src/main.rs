@@ -13,8 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![deny(unsafe_code)]
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -264,7 +266,7 @@ enum Commands {
         out_file: Option<PathBuf>,
     },
 
-    /// Export one or all 8 RFC 4180 CSV tables from SQLite, .json/.bib/.csv/.html/.graphml/.gexf, or the empirical benchmark
+    /// Export one or all 10 RFC 4180 CSV tables from SQLite, .json/.csl/.bib/.ris/.nbib/.csv/.html/.graphml/.gexf, or the empirical benchmark
     ExportCsv {
         #[arg(long)]
         from_db: Option<PathBuf>,
@@ -453,13 +455,35 @@ fn load_corpus_from_sources(
     }
 }
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn attach_parent_console_for_cli() {
+    if std::env::args_os().len() > 1 {
+        unsafe {
+            let _ = windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
+    }
+}
+
+fn flush_stdio() {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+}
+
 fn main() {
+    #[cfg(windows)]
+    attach_parent_console_for_cli();
+
     let cli = Cli::parse();
     if let Some(out_png) = cli.screenshot {
         if let Err(e) = capture_headless_screenshot_view(&out_png, cli.screenshot_view) {
             eprintln!("Screenshot error: {}", e);
+            flush_stdio();
             std::process::exit(1);
         }
+        flush_stdio();
         return;
     }
     match cli.command {
@@ -632,18 +656,27 @@ fn main() {
                     );
                     let target_db = save_db.or(from_db);
                     if let Some(ref db_p) = target_db {
-                        if let Ok(mut store) = LedgerStore::open(db_p) {
-                            let _ = store.save_corpus(&papers, &edges, true);
+                        if let Err(e) = LedgerStore::open(db_p)
+                            .and_then(|mut store| store.save_corpus(&papers, &edges, true))
+                        {
+                            eprintln!("Failed saving screened corpus to {:?}: {}", db_p, e);
+                            flush_stdio();
+                            std::process::exit(1);
                         }
                     }
                     let analytics =
                         compute_corpus_analytics(&papers, &edges, &AnalyticsParams::default());
                     if let Some(ref dir_p) = export_csv_dir {
-                        let _ = export_all_csv_suite(&papers, &edges, &analytics, dir_p);
+                        if let Err(e) = export_all_csv_suite(&papers, &edges, &analytics, dir_p) {
+                            eprintln!("Failed exporting CSV suite to {:?}: {}", dir_p, e);
+                            flush_stdio();
+                            std::process::exit(1);
+                        }
                     }
                 }
                 Err(e) => {
                     eprintln!("Screening failed: {}", e);
+                    flush_stdio();
                     std::process::exit(1);
                 }
             }
@@ -671,7 +704,11 @@ fn main() {
             let fmt = format.trim().to_ascii_lowercase();
 
             if fmt == "both" {
-                let _ = std::fs::create_dir_all(&out_dir);
+                if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                    eprintln!("Failed creating output directory {:?}: {}", out_dir, e);
+                    flush_stdio();
+                    std::process::exit(1);
+                }
                 let gml_p = out_dir.join("cit_atlas_network.graphml");
                 let gxf_p = out_dir.join("cit_atlas_network.gexf");
                 export_graphml(
@@ -698,7 +735,13 @@ fn main() {
             } else if fmt == "graphml" {
                 let dst = out_file.unwrap_or_else(|| out_dir.join("cit_atlas_network.graphml"));
                 if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!("Failed creating output directory {:?}: {}", parent, e);
+                            flush_stdio();
+                            std::process::exit(1);
+                        }
+                    }
                 }
                 export_graphml(
                     &papers,
@@ -714,7 +757,13 @@ fn main() {
             } else if fmt == "gexf" {
                 let dst = out_file.unwrap_or_else(|| out_dir.join("cit_atlas_network.gexf"));
                 if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!("Failed creating output directory {:?}: {}", parent, e);
+                            flush_stdio();
+                            std::process::exit(1);
+                        }
+                    }
                 }
                 export_gexf(
                     &papers,
@@ -1017,8 +1066,12 @@ fn main() {
 
             let target_db = save_db.or(from_db);
             if let Some(ref db_p) = target_db {
-                if let Ok(mut store) = LedgerStore::open(db_p) {
-                    let _ = store.save_rate_policies_and_audit(&pols, &logs);
+                if let Err(e) = LedgerStore::open(db_p)
+                    .and_then(|mut store| store.save_rate_policies_and_audit(&pols, &logs))
+                {
+                    eprintln!("Failed saving rate policies & audit to {:?}: {}", db_p, e);
+                    flush_stdio();
+                    std::process::exit(1);
                 }
             }
             if let Some(ref ap) = audit_csv_p {
@@ -1080,6 +1133,7 @@ fn main() {
             }
         }
     }
+    flush_stdio();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1110,12 +1164,22 @@ fn run_harvest_pipeline(
             }
 
             if let Some(ref dl_dir) = download_dir {
-                let _ = batch_download_corpus_pdfs(&mut harvest.papers, dl_dir, email, 450, None);
+                if let Err(e) =
+                    batch_download_corpus_pdfs(&mut harvest.papers, dl_dir, email, 450, None)
+                {
+                    eprintln!("Download batch error: {}", e);
+                    flush_stdio();
+                    std::process::exit(1);
+                }
             }
 
             if let Some(ref db_path) = db {
-                if let Ok(mut store) = LedgerStore::open(db_path) {
-                    let _ = store.save_corpus(&harvest.papers, &harvest.edges, false);
+                if let Err(e) = LedgerStore::open(db_path)
+                    .and_then(|mut store| store.save_corpus(&harvest.papers, &harvest.edges, false))
+                {
+                    eprintln!("Failed saving harvested corpus to {:?}: {}", db_path, e);
+                    flush_stdio();
+                    std::process::exit(1);
                 }
             }
 
@@ -1126,13 +1190,23 @@ fn run_harvest_pipeline(
                 print_console_digest(&analytics);
 
                 if let Some(ref csv_p) = export_csv {
-                    let _ = export_metrics_csv(&analytics, csv_p);
+                    if let Err(e) = export_metrics_csv(&analytics, csv_p) {
+                        eprintln!("Failed exporting metrics CSV {:?}: {}", csv_p, e);
+                        flush_stdio();
+                        std::process::exit(1);
+                    }
                 }
                 if let Some(ref csv_dir) = export_csv_dir {
-                    let _ = export_all_csv_suite(&harvest.papers, &harvest.edges, &analytics, csv_dir);
+                    if let Err(e) =
+                        export_all_csv_suite(&harvest.papers, &harvest.edges, &analytics, csv_dir)
+                    {
+                        eprintln!("Failed exporting CSV suite {:?}: {}", csv_dir, e);
+                        flush_stdio();
+                        std::process::exit(1);
+                    }
                 }
                 if let Some(ref gml_p) = export_graphml_p {
-                    let _ = export_graphml(
+                    if let Err(e) = export_graphml(
                         &harvest.papers,
                         &harvest.edges,
                         &analytics,
@@ -1140,10 +1214,14 @@ fn run_harvest_pipeline(
                         NodeColorEncoding::Discipline,
                         true,
                         gml_p,
-                    );
+                    ) {
+                        eprintln!("Failed exporting GraphML {:?}: {}", gml_p, e);
+                        flush_stdio();
+                        std::process::exit(1);
+                    }
                 }
                 if let Some(ref gxf_p) = export_gexf_p {
-                    let _ = export_gexf(
+                    if let Err(e) = export_gexf(
                         &harvest.papers,
                         &harvest.edges,
                         &analytics,
@@ -1151,15 +1229,26 @@ fn run_harvest_pipeline(
                         NodeColorEncoding::Discipline,
                         true,
                         gxf_p,
-                    );
+                    ) {
+                        eprintln!("Failed exporting GEXF {:?}: {}", gxf_p, e);
+                        flush_stdio();
+                        std::process::exit(1);
+                    }
                 }
                 if let Some(ref json_p) = export_json {
-                    let _ = export_bundle_json(&harvest.papers, &harvest.edges, &analytics, json_p);
+                    if let Err(e) =
+                        export_bundle_json(&harvest.papers, &harvest.edges, &analytics, json_p)
+                    {
+                        eprintln!("Failed exporting JSON bundle {:?}: {}", json_p, e);
+                        flush_stdio();
+                        std::process::exit(1);
+                    }
                 }
             }
         }
         Err(e) => {
             eprintln!("Harvest failed: {}", e);
+            flush_stdio();
             std::process::exit(1);
         }
     }
