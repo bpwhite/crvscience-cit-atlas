@@ -1484,7 +1484,9 @@ pub fn execute_multi_provider_search(req: &SearchRequest) -> Result<SearchHarves
     if req.providers.openaire {
         match search_openaire_graph(&http, req) {
             Ok(mut list) => {
-                let _ = harvest_openaire_scholexplorer_links(&http, &mut list, 12);
+                if let Err(w) = harvest_openaire_scholexplorer_links(&http, &mut list, 12) {
+                    warnings.push(format!("OpenAIRE ScholExplorer warning: {}", w));
+                }
                 provider_counts.push(("OpenAIRE Graph".to_string(), list.len()));
                 if req.snowball_hops >= 1 && !list.is_empty() {
                     match snowball_openaire_references(&http, &list, 20) {
@@ -2866,24 +2868,39 @@ fn harvest_openaire_scholexplorer_links(
     max_seeds: usize,
 ) -> Result<usize, String> {
     let mut linked = 0usize;
+    let mut succeeded = 0usize;
+    let mut first_err: Option<String> = None;
     for p in papers.iter_mut().filter(|p| !p.doi.is_empty()).take(max_seeds) {
         let url = format!(
             "https://api.scholexplorer.openaire.eu/v3/Links?sourcePid={}&page=0",
             percent_encode(&p.doi)
         );
-        if let Ok(val) = http.get_json_with_bearer(&url, None, "search_api") {
-            let (refs, dcs) = parse_scholexplorer_links_json(&val, &p.doi);
-            for r in refs {
-                if !p.raw_references.contains(&r) {
-                    p.raw_references.push(r);
-                    linked += 1;
+        match http.get_json_with_bearer(&url, None, "search_api") {
+            Ok(val) => {
+                succeeded += 1;
+                let (refs, dcs) = parse_scholexplorer_links_json(&val, &p.doi);
+                for r in refs {
+                    if !p.raw_references.contains(&r) {
+                        p.raw_references.push(r);
+                        linked += 1;
+                    }
+                }
+                for dl in dcs {
+                    if !p.datacite_links.iter().any(|x| x.artifact_doi == dl.artifact_doi) {
+                        p.datacite_links.push(dl);
+                    }
                 }
             }
-            for dl in dcs {
-                if !p.datacite_links.iter().any(|x| x.artifact_doi == dl.artifact_doi) {
-                    p.datacite_links.push(dl);
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
                 }
             }
+        }
+    }
+    if succeeded == 0 {
+        if let Some(err) = first_err {
+            return Err(err);
         }
     }
     Ok(linked)

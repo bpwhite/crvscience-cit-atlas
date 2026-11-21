@@ -192,7 +192,7 @@ impl PoliteWebCrawler {
             return;
         }
         let pseudo_jitter = if jitter_ms > 0 {
-            ((step_index as u64).wrapping_mul(2654435761) % jitter_ms)
+            (step_index as u64).wrapping_mul(2654435761) % jitter_ms
         } else {
             0
         };

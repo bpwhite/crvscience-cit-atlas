@@ -2,9 +2,10 @@
 name = "cit-atlas"
 version = "1.8.0"
 edition = "2021"
-authors = ["Citations Analytics Suite"]
+authors = ["Bryan P. White <bryan@crvscience.com>"]
 description = "Native Rust Citations Analytics Workstation with wgpu WGSL 50,000+ Node Graph Renderer, Per-Domain Token-Bucket Rate Limiter & Crawl Audit Telemetry, Europe PMC/UniProt/PDB & DataCite Bridges, Retraction Watch Screening & 10-Table CSV Suite"
 license = "GPL-3.0-or-later"
+repository = "https://github.com/bpwhite/crvscience-cit-atlas"
 
 [lib]
 name = "cit_atlas"

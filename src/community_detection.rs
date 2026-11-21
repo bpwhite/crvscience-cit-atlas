@@ -554,7 +554,7 @@ pub fn run_infomap_compression(
         // L(M) via O(deg(u)) incremental module exit/stay flow accumulators.
         let fast_louv = run_louvain_modularity(undir_adj, disciplines, paper_ids, cb_scores, 1.0);
         let mut mod_of = fast_louv.assignments;
-        let mut k_cap = fast_louv.num_communities.max(1) + 1;
+        let k_cap = fast_louv.num_communities.max(1) + 1;
 
         let mut flow_in: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
         for u in 0..n {

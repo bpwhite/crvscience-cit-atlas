@@ -224,6 +224,40 @@ pub struct CitAtlasApp {
     worker_rx: Receiver<WorkerEvent>,
 }
 
+fn parse_pop_year_range(
+    min_raw: &str,
+    max_raw: &str,
+) -> Result<(Option<i32>, Option<i32>, bool), String> {
+    let min_trim = min_raw.trim();
+    let max_trim = max_raw.trim();
+    let min_yr = if min_trim.is_empty() {
+        None
+    } else {
+        Some(min_trim.parse::<i32>().map_err(|_| {
+            format!(
+                "Invalid start year '{}': enter a valid integer year (e.g. 2000).",
+                min_trim
+            )
+        })?)
+    };
+    let max_yr = if max_trim.is_empty() {
+        None
+    } else {
+        Some(max_trim.parse::<i32>().map_err(|_| {
+            format!(
+                "Invalid end year '{}': enter a valid integer year (e.g. 2026).",
+                max_trim
+            )
+        })?)
+    };
+    if let (Some(lo), Some(hi)) = (min_yr, max_yr) {
+        if lo > hi {
+            return Ok((Some(hi), Some(lo), true));
+        }
+    }
+    Ok((min_yr, max_yr, false))
+}
+
 impl CitAtlasApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut use_wgpu_pipeline = false;
@@ -786,12 +820,56 @@ impl CitAtlasApp {
             })
     }
 
+    fn sync_and_validate_pop_year_range(&mut self) -> bool {
+        match parse_pop_year_range(&self.pop_year_min_input, &self.pop_year_max_input) {
+            Ok((ymin, ymax, swapped)) => {
+                self.search_req.year_min = ymin;
+                self.search_req.year_max = ymax;
+                if swapped {
+                    if let (Some(lo), Some(hi)) = (ymin, ymax) {
+                        self.pop_year_min_input = lo.to_string();
+                        self.pop_year_max_input = hi.to_string();
+                        self.status_banner = format!(
+                            "Auto-swapped inverted publication year range to {}..={}.",
+                            lo, hi
+                        );
+                    }
+                }
+                true
+            }
+            Err(err) => {
+                self.status_banner = err;
+                false
+            }
+        }
+    }
+
+    fn start_single_doi_lookup(&mut self) {
+        if self.is_busy {
+            return;
+        }
+        let doi = self.single_doi_input.clone();
+        if doi.trim().is_empty() {
+            self.status_banner = "Enter a DOI before resolving.".to_string();
+            return;
+        }
+        let email = self.search_req.polite_email.clone();
+        let tx = self.worker_tx.clone();
+        self.is_busy = true;
+        self.busy_label = format!("Resolving DOI {}...", doi);
+        thread::spawn(move || {
+            let res = lookup_single_doi(&doi, &email);
+            let _ = tx.send(WorkerEvent::DoiLookupCompleted(res));
+        });
+    }
+
     fn start_background_search_with_mode(&mut self, merge_into_existing: bool) {
         if self.is_busy {
             return;
         }
-        self.search_req.year_min = self.pop_year_min_input.trim().parse::<i32>().ok();
-        self.search_req.year_max = self.pop_year_max_input.trim().parse::<i32>().ok();
+        if !self.sync_and_validate_pop_year_range() {
+            return;
+        }
         let active_label = crate::search_providers::build_effective_query(&self.search_req);
         self.is_busy = true;
         self.busy_label = format!("Harvesting scholarly APIs & crawlers for '{}'...", active_label);
@@ -1036,6 +1114,19 @@ impl CitAtlasApp {
     pub fn update_ui(&mut self, ctx: &egui::Context) {
         self.poll_worker_events(ctx);
 
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_about_window = !self.show_about_window;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.show_about_window {
+                self.show_about_window = false;
+            } else if self.show_dossier_panel {
+                self.show_dossier_panel = false;
+            }
+        }
+        let focus_filter_shortcut =
+            ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::F));
+
         // Top Navigation & Global Parameter Ribbon
         egui::TopBottomPanel::top("cit_atlas_top_ribbon").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1075,6 +1166,7 @@ impl CitAtlasApp {
                 ui.label("W (yr):");
                 if ui
                     .add(egui::Slider::new(&mut self.params.window_width, 3..=25))
+                    .on_hover_text("Sliding time-window width W (years) for temporal community drift (NMI/JSD) and mutual information.")
                     .changed()
                 {
                     changed = true;
@@ -1082,6 +1174,7 @@ impl CitAtlasApp {
                 ui.label("Stride S:");
                 if ui
                     .add(egui::Slider::new(&mut self.params.window_stride, 1..=10))
+                    .on_hover_text("Step stride S (years) between consecutive sliding time windows in Topic Drift (MI & JSD).")
                     .changed()
                 {
                     changed = true;
@@ -1089,6 +1182,7 @@ impl CitAtlasApp {
                 ui.label("Half-life tau:");
                 if ui
                     .add(egui::Slider::new(&mut self.params.half_life, 2.0..=20.0))
+                    .on_hover_text("Exponential citation-decay half-life tau (years) for instantaneous citation velocity v_exp.")
                     .changed()
                 {
                     changed = true;
@@ -1096,23 +1190,29 @@ impl CitAtlasApp {
                 ui.label("Horizon:");
                 if ui
                     .add(egui::Slider::new(&mut self.params.horizon_year, 1965..=2026))
+                    .on_hover_text("Upper publication & citation cutoff year (Horizon) applied across all graph, velocity, and PoP metrics.")
                     .changed()
                 {
                     changed = true;
                 }
                 if ui
                     .checkbox(&mut self.params.exclude_retracted, "Hide Retracted")
+                    .on_hover_text("Exclude retracted or withdrawn papers from active analytics, graph views, and PoP metrics.")
                     .changed()
                 {
                     changed = true;
                 }
                 ui.separator();
                 ui.label("Filter:");
-                ui.add(
+                let filter_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.filter_text)
+                        .id_salt("cit_atlas_global_filter")
                         .desired_width(130.0)
                         .hint_text("Author, title, DOI..."),
                 );
+                if focus_filter_shortcut {
+                    filter_resp.request_focus();
+                }
                 if ui
                     .selectable_label(self.disc_filter.is_none(), "ALL")
                     .clicked()
@@ -1988,7 +2088,7 @@ impl CitAtlasApp {
         for pair in nmi_pts.windows(2) {
             painter.line_segment(
                 [pair[0], pair[1]],
-                Stroke::new(2.2, Color32::from_rgb(16, 185, 129)),
+                Stroke::new(2.2_f32, Color32::from_rgb(16, 185, 129)),
             );
         }
         for pt in nmi_pts {
@@ -2048,12 +2148,12 @@ impl CitAtlasApp {
                 painter.circle_stroke(
                     center,
                     rad + 3.0,
-                    Stroke::new(1.5, Color32::from_rgb(250, 204, 21)),
+                    Stroke::new(1.5_f32, Color32::from_rgb(250, 204, 21)),
                 );
             }
             painter.circle_filled(center, rad, Color32::from_rgba_unmultiplied(r, g, b, 215));
             if p.record.id == self.focused_paper_id {
-                painter.circle_stroke(center, rad + 1.2, Stroke::new(2.0, Color32::WHITE));
+                painter.circle_stroke(center, rad + 1.2, Stroke::new(2.0_f32, Color32::WHITE));
             }
 
             if let Some(cp) = click_pos {
@@ -2405,7 +2505,7 @@ impl CitAtlasApp {
         painter.rect_stroke(
             rect,
             6.0,
-            Stroke::new(1.0, Color32::from_rgb(30, 41, 59)),
+            Stroke::new(1.0_f32, Color32::from_rgb(30, 41, 59)),
             egui::StrokeKind::Inside,
         );
 
@@ -2814,7 +2914,7 @@ impl CitAtlasApp {
             painter.rect_stroke(
                 box_rect,
                 5.0,
-                Stroke::new(1.0, border_col),
+                Stroke::new(1.0_f32, border_col),
                 egui::StrokeKind::Inside,
             );
             painter.text(
@@ -2838,7 +2938,7 @@ impl CitAtlasApp {
             painter.rect_stroke(
                 mm_rect,
                 4.0,
-                Stroke::new(1.0, Color32::from_rgb(51, 65, 85)),
+                Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
                 egui::StrokeKind::Inside,
             );
             let step = (n / 1_200).max(1);
@@ -2872,7 +2972,7 @@ impl CitAtlasApp {
             painter.rect_stroke(
                 vp_rect,
                 2.0,
-                Stroke::new(1.0, Color32::from_rgb(56, 189, 248)),
+                Stroke::new(1.0_f32, Color32::from_rgb(56, 189, 248)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -2905,7 +3005,7 @@ impl CitAtlasApp {
         painter.rect_stroke(
             leg_rect,
             5.0,
-            Stroke::new(1.0, Color32::from_rgb(51, 65, 85)),
+            Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
             egui::StrokeKind::Inside,
         );
 
@@ -2933,7 +3033,7 @@ impl CitAtlasApp {
 
         // Row 1: Paper circle
         painter.circle_filled(Pos2::new(sx, y), 4.5, Color32::from_rgb(56, 189, 248));
-        painter.circle_stroke(Pos2::new(sx, y), 4.5, Stroke::new(1.0, Color32::WHITE));
+        painter.circle_stroke(Pos2::new(sx, y), 4.5, Stroke::new(1.0_f32, Color32::WHITE));
         painter.text(
             Pos2::new(tx, y),
             Align2::LEFT_CENTER,
@@ -2954,7 +3054,7 @@ impl CitAtlasApp {
                     Pos2::new(ds_pos.x - d, ds_pos.y),
                 ],
                 Color32::from_rgb(45, 212, 191),
-                Stroke::new(0.8, Color32::WHITE),
+                Stroke::new(0.8_f32, Color32::WHITE),
             ));
             let sw_pos = Pos2::new(sx + 13.0, y);
             painter.add(egui::Shape::convex_polygon(
@@ -2965,7 +3065,7 @@ impl CitAtlasApp {
                     Pos2::new(sw_pos.x - d, sw_pos.y),
                 ],
                 Color32::from_rgb(167, 139, 250),
-                Stroke::new(0.8, Color32::WHITE),
+                Stroke::new(0.8_f32, Color32::WHITE),
             ));
             painter.text(
                 Pos2::new(tx + 12.0, y),
@@ -2988,7 +3088,7 @@ impl CitAtlasApp {
             painter.add(egui::Shape::convex_polygon(
                 hex,
                 Color32::from_rgb(245, 158, 11),
-                Stroke::new(0.8, Color32::WHITE),
+                Stroke::new(0.8_f32, Color32::WHITE),
             ));
             let oct_x = sx + 13.0;
             let oct: Vec<Pos2> = (0..8)
@@ -3000,7 +3100,7 @@ impl CitAtlasApp {
             painter.add(egui::Shape::convex_polygon(
                 oct,
                 Color32::from_rgb(6, 182, 212),
-                Stroke::new(0.8, Color32::WHITE),
+                Stroke::new(0.8_f32, Color32::WHITE),
             ));
             painter.text(
                 Pos2::new(tx + 12.0, y),
@@ -3018,7 +3118,7 @@ impl CitAtlasApp {
                     Pos2::new(sx - d * 0.95, y + d * 0.78),
                 ],
                 Color32::from_rgb(132, 204, 22),
-                Stroke::new(0.8, Color32::WHITE),
+                Stroke::new(0.8_f32, Color32::WHITE),
             ));
             painter.text(
                 Pos2::new(tx, y),
@@ -3031,9 +3131,9 @@ impl CitAtlasApp {
         }
 
         // Rings row: Focal / Beauty / Retracted
-        painter.circle_stroke(Pos2::new(sx, y), 4.4, Stroke::new(1.8, Color32::from_rgb(56, 189, 248)));
-        painter.circle_stroke(Pos2::new(sx + 12.0, y), 4.4, Stroke::new(1.8, Color32::from_rgb(250, 204, 21)));
-        painter.circle_stroke(Pos2::new(sx + 24.0, y), 4.4, Stroke::new(1.8, Color32::from_rgb(239, 68, 68)));
+        painter.circle_stroke(Pos2::new(sx, y), 4.4, Stroke::new(1.8_f32, Color32::from_rgb(56, 189, 248)));
+        painter.circle_stroke(Pos2::new(sx + 12.0, y), 4.4, Stroke::new(1.8_f32, Color32::from_rgb(250, 204, 21)));
+        painter.circle_stroke(Pos2::new(sx + 24.0, y), 4.4, Stroke::new(1.8_f32, Color32::from_rgb(239, 68, 68)));
         painter.text(
             Pos2::new(tx + 22.0, y),
             Align2::LEFT_CENTER,
@@ -3046,11 +3146,11 @@ impl CitAtlasApp {
         // Edges row: Geodesic / Zombie / Citation
         painter.line_segment(
             [Pos2::new(sx - 4.0, y), Pos2::new(sx + 8.0, y)],
-            Stroke::new(2.2, Color32::from_rgb(34, 211, 238)),
+            Stroke::new(2.2_f32, Color32::from_rgb(34, 211, 238)),
         );
         painter.line_segment(
             [Pos2::new(sx + 12.0, y), Pos2::new(sx + 24.0, y)],
-            Stroke::new(2.2, Color32::from_rgb(248, 113, 113)),
+            Stroke::new(2.2_f32, Color32::from_rgb(248, 113, 113)),
         );
         painter.text(
             Pos2::new(tx + 18.0, y),
@@ -3071,7 +3171,7 @@ impl CitAtlasApp {
         painter.rect_stroke(
             rect,
             6.0,
-            Stroke::new(1.0, Color32::from_rgb(30, 41, 59)),
+            Stroke::new(1.0_f32, Color32::from_rgb(30, 41, 59)),
             egui::StrokeKind::Inside,
         );
 
@@ -3121,13 +3221,13 @@ impl CitAtlasApp {
             if gx > rect.left() && gx < rect.right() {
                 painter.line_segment(
                     [Pos2::new(gx, rect.top() + 2.0), Pos2::new(gx, rect.bottom() - 2.0)],
-                    Stroke::new(0.6, Color32::from_rgba_unmultiplied(30, 41, 59, 110)),
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(30, 41, 59, 110)),
                 );
             }
             if gy > rect.top() && gy < rect.bottom() {
                 painter.line_segment(
                     [Pos2::new(rect.left() + 2.0, gy), Pos2::new(rect.right() - 2.0, gy)],
-                    Stroke::new(0.6, Color32::from_rgba_unmultiplied(30, 41, 59, 110)),
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(30, 41, 59, 110)),
                 );
             }
         }
@@ -3296,7 +3396,7 @@ impl CitAtlasApp {
                     if rect.contains(screen_pts[pi]) {
                         painter.line_segment(
                             [screen_pts[pi], a_screen],
-                            Stroke::new(1.1, art_col),
+                            Stroke::new(1.1_f32, art_col),
                         );
                     }
                 }
@@ -3311,7 +3411,7 @@ impl CitAtlasApp {
                 painter.add(egui::Shape::convex_polygon(
                     diamond,
                     art_col,
-                    Stroke::new(1.0, Color32::from_rgb(241, 245, 249)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(241, 245, 249)),
                 ));
             }
         }
@@ -3332,7 +3432,7 @@ impl CitAtlasApp {
 
                 for &pi in &bn.linked_paper_indices {
                     if rect.contains(screen_pts[pi]) {
-                        painter.line_segment([screen_pts[pi], b_screen], Stroke::new(1.1, bio_col));
+                        painter.line_segment([screen_pts[pi], b_screen], Stroke::new(1.1_f32, bio_col));
                     }
                 }
 
@@ -3359,7 +3459,7 @@ impl CitAtlasApp {
                 painter.add(egui::Shape::convex_polygon(
                     poly,
                     bio_col,
-                    Stroke::new(1.0, Color32::from_rgb(241, 245, 249)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(241, 245, 249)),
                 ));
             }
             for &(u_rel, p_rel) in &self.graph_viewer.bio_cross_edges {
@@ -3367,7 +3467,7 @@ impl CitAtlasApp {
                     if rect.contains(p1) || rect.contains(p2) {
                         painter.line_segment(
                             [p1, p2],
-                            Stroke::new(1.4, Color32::from_rgba_unmultiplied(34, 211, 238, 210)),
+                            Stroke::new(1.4_f32, Color32::from_rgba_unmultiplied(34, 211, 238, 210)),
                         );
                     }
                 }
@@ -3497,13 +3597,13 @@ impl CitAtlasApp {
                 painter.circle_stroke(
                     center,
                     r + 4.5,
-                    Stroke::new(2.2, Color32::from_rgb(239, 68, 68)),
+                    Stroke::new(2.2_f32, Color32::from_rgb(239, 68, 68)),
                 );
             } else if p.beauty_b >= 10.0 && in_spot {
                 painter.circle_stroke(
                     center,
                     r + 3.2,
-                    Stroke::new(1.5, Color32::from_rgba_unmultiplied(250, 204, 21, 190)),
+                    Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(250, 204, 21, 190)),
                 );
             }
 
@@ -3511,7 +3611,7 @@ impl CitAtlasApp {
                 painter.circle_stroke(
                     center,
                     r + 6.0,
-                    Stroke::new(2.2, Color32::from_rgb(56, 189, 248)),
+                    Stroke::new(2.2_f32, Color32::from_rgb(56, 189, 248)),
                 );
             }
 
@@ -3520,7 +3620,7 @@ impl CitAtlasApp {
                 center,
                 r,
                 Stroke::new(
-                    if is_pinned { 2.0 } else { 0.9 },
+                    if is_pinned { 2.0_f32 } else { 0.9_f32 },
                     if is_pinned {
                         Color32::from_rgb(250, 204, 21)
                     } else {
@@ -3612,7 +3712,7 @@ impl CitAtlasApp {
             painter.rect_stroke(
                 box_rect,
                 5.0,
-                Stroke::new(1.0, border_col),
+                Stroke::new(1.0_f32, border_col),
                 egui::StrokeKind::Inside,
             );
             painter.text(
@@ -3640,7 +3740,7 @@ impl CitAtlasApp {
             painter.rect_stroke(
                 mm_rect,
                 4.0,
-                Stroke::new(1.0, Color32::from_rgb(51, 65, 85)),
+                Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
                 egui::StrokeKind::Inside,
             );
             for p in &self.analytics.papers {
@@ -3668,7 +3768,7 @@ impl CitAtlasApp {
             painter.rect_stroke(
                 vp_rect,
                 2.0,
-                Stroke::new(1.0, Color32::from_rgb(56, 189, 248)),
+                Stroke::new(1.0_f32, Color32::from_rgb(56, 189, 248)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -3707,8 +3807,9 @@ impl CitAtlasApp {
     }
 
     fn apply_offline_instant_search(&mut self, merge_into_existing: bool) {
-        self.search_req.year_min = self.pop_year_min_input.trim().parse::<i32>().ok();
-        self.search_req.year_max = self.pop_year_max_input.trim().parse::<i32>().ok();
+        if !self.sync_and_validate_pop_year_range() {
+            return;
+        }
         let summary = search_offline_scholarly_only(&self.search_req);
         if summary.papers.is_empty() {
             self.status_banner = "Local scholarly index returned 0 matches for current PoP criteria.".to_string();
@@ -3921,79 +4022,135 @@ impl CitAtlasApp {
                                 .color(Color32::from_rgb(56, 189, 248)),
                         );
                         let field_w = (col2_w - 175.0).max(180.0);
+                        let mut submit_search_on_enter = false;
                         egui::Grid::new("pop_query_grid")
                             .num_columns(2)
                             .spacing([8.0, 4.0])
                             .show(ui, |ui| {
+                                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                                 ui.label("Authors:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.search_req.authors)
-                                        .desired_width(field_w)
-                                        .hint_text("e.g. Shannon, Harzing, Vaswani"),
-                                );
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.search_req.authors)
+                                            .desired_width(field_w)
+                                            .hint_text("e.g. Shannon, Harzing, Vaswani"),
+                                    )
+                                    .lost_focus()
+                                    && enter_pressed
+                                {
+                                    submit_search_on_enter = true;
+                                }
                                 ui.end_row();
 
                                 ui.label("Publication / Venue:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.search_req.publication_venue)
-                                        .desired_width(field_w)
-                                        .hint_text("e.g. Nature, Scientometrics, NeurIPS, PNAS"),
-                                );
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.search_req.publication_venue)
+                                            .desired_width(field_w)
+                                            .hint_text("e.g. Nature, Scientometrics, NeurIPS, PNAS"),
+                                    )
+                                    .lost_focus()
+                                    && enter_pressed
+                                {
+                                    submit_search_on_enter = true;
+                                }
                                 ui.end_row();
 
                                 ui.label("Title words:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.search_req.title_words)
-                                        .desired_width(field_w)
-                                        .hint_text("Words required in paper title"),
-                                );
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.search_req.title_words)
+                                            .desired_width(field_w)
+                                            .hint_text("Words required in paper title"),
+                                    )
+                                    .lost_focus()
+                                    && enter_pressed
+                                {
+                                    submit_search_on_enter = true;
+                                }
                                 ui.end_row();
 
                                 ui.label("Keywords (All):");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.search_req.keywords_all)
-                                        .desired_width(field_w)
-                                        .hint_text("Keywords in title, abstract or concepts"),
-                                );
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.search_req.keywords_all)
+                                            .desired_width(field_w)
+                                            .hint_text("Keywords in title, abstract or concepts"),
+                                    )
+                                    .lost_focus()
+                                    && enter_pressed
+                                {
+                                    submit_search_on_enter = true;
+                                }
                                 ui.end_row();
 
                                 ui.label("Free-text Query:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.search_req.query)
-                                        .desired_width(field_w)
-                                        .hint_text("General bibliometric query"),
-                                );
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.search_req.query)
+                                            .desired_width(field_w)
+                                            .hint_text("General bibliometric query"),
+                                    )
+                                    .lost_focus()
+                                    && enter_pressed
+                                {
+                                    submit_search_on_enter = true;
+                                }
                                 ui.end_row();
 
                                 ui.label("Exclude words:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.search_req.exclude_words)
-                                        .desired_width(field_w)
-                                        .hint_text("Terms to exclude (e.g. survey retracted)"),
-                                );
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.search_req.exclude_words)
+                                            .desired_width(field_w)
+                                            .hint_text("Terms to exclude (e.g. survey retracted)"),
+                                    )
+                                    .lost_focus()
+                                    && enter_pressed
+                                {
+                                    submit_search_on_enter = true;
+                                }
                                 ui.end_row();
 
                                 ui.label("DOI / PMID / arXiv / ORCID:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.search_req.identifier_lookup)
-                                        .desired_width(field_w)
-                                        .hint_text("10.1073/pnas.0507655102 or arXiv:1706.03762 or PMID or ORCID"),
-                                );
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.search_req.identifier_lookup)
+                                            .desired_width(field_w)
+                                            .hint_text("10.1073/pnas.0507655102 or arXiv:1706.03762 or PMID or ORCID"),
+                                    )
+                                    .lost_focus()
+                                    && enter_pressed
+                                {
+                                    submit_search_on_enter = true;
+                                }
                                 ui.end_row();
 
                                 ui.label("Years & Scope:");
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.pop_year_min_input)
-                                            .desired_width(58.0)
-                                            .hint_text("From"),
-                                    );
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut self.pop_year_min_input)
+                                                .desired_width(58.0)
+                                                .hint_text("From"),
+                                        )
+                                        .lost_focus()
+                                        && enter_pressed
+                                    {
+                                        submit_search_on_enter = true;
+                                    }
                                     ui.label("to");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.pop_year_max_input)
-                                            .desired_width(58.0)
-                                            .hint_text("To"),
-                                    );
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut self.pop_year_max_input)
+                                                .desired_width(58.0)
+                                                .hint_text("To"),
+                                        )
+                                        .lost_focus()
+                                        && enter_pressed
+                                    {
+                                        submit_search_on_enter = true;
+                                    }
                                     ui.checkbox(&mut self.search_req.oa_only, "OA Only");
                                     if ui.small_button("Clear").clicked() {
                                         self.search_req.authors.clear();
@@ -4018,7 +4175,7 @@ impl CitAtlasApp {
                                 RichText::new("Search Databases").strong().color(Color32::WHITE),
                             )
                             .fill(Color32::from_rgb(14, 116, 144));
-                            if ui.add_enabled(!self.is_busy, primary_btn).clicked() {
+                            if ui.add_enabled(!self.is_busy, primary_btn).clicked() || (!self.is_busy && submit_search_on_enter) {
                                 self.start_background_search_with_mode(self.merge_search_results);
                             }
                             if ui
@@ -4076,24 +4233,19 @@ impl CitAtlasApp {
                         ui.collapsing("Direct DOI Resolver, Corpus Screening & OA PDF Batch Downloader", |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("DOI:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.single_doi_input)
-                                        .desired_width(200.0)
-                                        .hint_text("10.1073/pnas.1424329112"),
-                                );
-                                if ui
+                                let doi_enter = ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.single_doi_input)
+                                            .desired_width(200.0)
+                                            .hint_text("10.1073/pnas.1424329112"),
+                                    )
+                                    .lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let doi_clicked = ui
                                     .add_enabled(!self.is_busy, egui::Button::new("Resolve & Add DOI"))
-                                    .clicked()
-                                {
-                                    let doi = self.single_doi_input.clone();
-                                    let email = self.search_req.polite_email.clone();
-                                    let tx = self.worker_tx.clone();
-                                    self.is_busy = true;
-                                    self.busy_label = format!("Resolving DOI {}...", doi);
-                                    thread::spawn(move || {
-                                        let res = lookup_single_doi(&doi, &email);
-                                        let _ = tx.send(WorkerEvent::DoiLookupCompleted(res));
-                                    });
+                                    .clicked();
+                                if !self.is_busy && (doi_clicked || doi_enter) {
+                                    self.start_single_doi_lookup();
                                 }
                                 if ui
                                     .add_enabled(
@@ -5323,11 +5475,11 @@ impl CitAtlasApp {
             let on_path = path_edges.contains(&(cond.u.min(cond.v), cond.u.max(cond.v)));
 
             let stroke = if on_path {
-                Stroke::new(2.8, Color32::from_rgb(34, 211, 238))
+                Stroke::new(2.8_f32, Color32::from_rgb(34, 211, 238))
             } else if self.highlight_conduits && cond.cross_disc {
-                Stroke::new(1.5, Color32::from_rgba_unmultiplied(244, 114, 182, 165))
+                Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(244, 114, 182, 165))
             } else {
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(148, 163, 184, 55))
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(148, 163, 184, 55))
             };
             painter.line_segment([su, sv], stroke);
         }
@@ -5370,11 +5522,11 @@ impl CitAtlasApp {
             };
 
             if path_nodes.contains(&p.idx) {
-                painter.circle_stroke(sc, rad + 3.5, Stroke::new(2.4, Color32::from_rgb(34, 211, 238)));
+                painter.circle_stroke(sc, rad + 3.5, Stroke::new(2.4_f32, Color32::from_rgb(34, 211, 238)));
             }
             painter.circle_filled(sc, rad, Color32::from_rgb(r, g, b));
             if p.record.id == self.focused_paper_id {
-                painter.circle_stroke(sc, rad + 1.5, Stroke::new(2.0, Color32::WHITE));
+                painter.circle_stroke(sc, rad + 1.5, Stroke::new(2.0_f32, Color32::WHITE));
             }
             if cb_val > max_cb * 0.30 || path_nodes.contains(&p.idx) {
                 painter.text(
@@ -5429,13 +5581,13 @@ impl CitAtlasApp {
         let y_hub = y_of(hub_cut);
         painter.line_segment(
             [Pos2::new(rect.left() + pad_l, y_hub), Pos2::new(rect.right() - pad_r, y_hub)],
-            Stroke::new(1.0, Color32::from_rgb(71, 85, 105)),
+            Stroke::new(1.0_f32, Color32::from_rgb(71, 85, 105)),
         );
         for p_cut in [0.05f32, 0.62, 0.80] {
             let x = x_of(p_cut);
             painter.line_segment(
                 [Pos2::new(x, y_hub), Pos2::new(x, rect.top() + pad_t + ph)],
-                Stroke::new(1.0, Color32::from_rgb(51, 65, 85)),
+                Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
             );
         }
 
@@ -5907,7 +6059,7 @@ impl CitAtlasApp {
                 .map(|(i, w)| Pos2::new(x_of(i), y_of(w.within_drift[d.index()] as f32)))
                 .collect();
             for pair in pts.windows(2) {
-                painter.line_segment([pair[0], pair[1]], Stroke::new(1.3, col));
+                painter.line_segment([pair[0], pair[1]], Stroke::new(1.3_f32, col));
             }
         }
 
@@ -5920,7 +6072,7 @@ impl CitAtlasApp {
         for pair in nmi_pts.windows(2) {
             painter.line_segment(
                 [pair[0], pair[1]],
-                Stroke::new(2.5, Color32::from_rgb(16, 185, 129)),
+                Stroke::new(2.5_f32, Color32::from_rgb(16, 185, 129)),
             );
         }
         for (i, &pt) in nmi_pts.iter().enumerate() {
@@ -6349,6 +6501,7 @@ impl CitAtlasApp {
                             .set_file_name("cit_atlas_network.graphml")
                             .save_file()
                         {
+                            self.sync_gpu_mirror_into_viewer();
                             match export_graphml(
                                 &self.raw_papers,
                                 &self.raw_edges,
@@ -6369,6 +6522,7 @@ impl CitAtlasApp {
                             .set_file_name("cit_atlas_network.gexf")
                             .save_file()
                         {
+                            self.sync_gpu_mirror_into_viewer();
                             match export_gexf(
                                 &self.raw_papers,
                                 &self.raw_edges,
@@ -6681,9 +6835,10 @@ impl CitAtlasApp {
                     .hint_text("api.openaire.eu"),
             );
             if ui.button("Add Policy").clicked() && !self.custom_domain_input.trim().is_empty() {
-                if let Ok(mut g) = global_limiter_mutex().lock() {
+                let domain = self.custom_domain_input.trim().to_string();
+                let updated = if let Ok(mut g) = global_limiter_mutex().lock() {
                     g.update_domain_policy(
-                        self.custom_domain_input.trim(),
+                        &domain,
                         3.0,
                         5.0,
                         250,
@@ -6691,9 +6846,20 @@ impl CitAtlasApp {
                         true,
                         false,
                     );
+                    true
+                } else {
+                    false
+                };
+                if updated {
+                    self.custom_domain_input.clear();
+                    policies = snapshot_global_policies();
+                    self.status_banner = format!(
+                        "Added token-bucket rate policy for '{}' (3.0 rps, burst 5).",
+                        domain
+                    );
+                } else {
+                    self.status_banner = format!("Failed to update rate policy for '{}': limiter lock unavailable.", domain);
                 }
-                self.custom_domain_input.clear();
-                policies = snapshot_global_policies();
             }
         });
 
@@ -6954,7 +7120,7 @@ impl CitAtlasApp {
         painter.rect_stroke(
             rect,
             4.0,
-            Stroke::new(1.0, Color32::from_rgb(30, 41, 59)),
+            Stroke::new(1.0_f32, Color32::from_rgb(30, 41, 59)),
             egui::StrokeKind::Inside,
         );
 
@@ -7504,5 +7670,102 @@ mod tests {
         assert_eq!(icon.width, 64);
         assert_eq!(icon.height, 64);
         assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+    }
+
+    #[test]
+    fn year_range_parser_swaps_inverted_and_rejects_malformed() {
+        assert_eq!(
+            parse_pop_year_range("2025", "2010"),
+            Ok((Some(2010), Some(2025), true))
+        );
+        assert!(parse_pop_year_range("202x", "").is_err());
+        assert_eq!(parse_pop_year_range("", ""), Ok((None, None, false)));
+    }
+
+    #[test]
+    fn gpu_mirror_sync_populates_positions_before_graphml_export() {
+        let ctx = egui::Context::default();
+        let mut app = CitAtlasApp::new_with_ctx(&ctx, false, "test".to_string());
+        let first_id = app.analytics.papers[0].record.id.clone();
+        {
+            let mut mir = app.gpu_mirror.lock().expect("gpu mirror lock");
+            mir.coords = vec![[0.0, 0.0]; app.analytics.papers.len()];
+            mir.coords[0] = [0.42, -0.31];
+        }
+        app.sync_gpu_mirror_into_viewer();
+        assert_eq!(
+            app.graph_viewer.positions.get(&first_id).copied(),
+            Some([0.42, -0.31])
+        );
+
+        let tmp = std::env::temp_dir().join(format!(
+            "cit_atlas_gpu_sync_{}.graphml",
+            std::process::id()
+        ));
+        export_graphml(
+            &app.raw_papers,
+            &app.raw_edges,
+            &app.analytics,
+            Some(&app.graph_viewer.positions),
+            app.graph_viewer.color_by,
+            false,
+            &tmp,
+        )
+        .expect("export_graphml");
+        let xml = std::fs::read_to_string(&tmp).expect("read GraphML");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(xml.contains("<data key=\"n_x\">210.00</data>"));
+        assert!(xml.contains("<data key=\"n_y\">155.00</data>"));
+    }
+
+    #[test]
+    fn headless_f1_and_escape_shortcuts_toggle_and_dismiss_panels() {
+        let ctx = egui::Context::default();
+        let mut app = CitAtlasApp::new_with_ctx(&ctx, false, "test".to_string());
+        app.show_dossier_panel = true;
+        assert!(!app.show_about_window);
+
+        let step_key = |app: &mut CitAtlasApp, key: egui::Key, modifiers: egui::Modifiers| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                modifiers,
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            let _ = ctx.run(raw, |c| app.update_ui(c));
+        };
+
+        step_key(&mut app, egui::Key::F1, egui::Modifiers::NONE);
+        assert!(app.show_about_window);
+        assert!(app.show_dossier_panel);
+
+        step_key(&mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!app.show_about_window);
+        assert!(app.show_dossier_panel);
+
+        step_key(&mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!app.show_about_window);
+        assert!(!app.show_dossier_panel);
+
+        step_key(&mut app, egui::Key::F, egui::Modifiers::CTRL);
+        let mut raw_text = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        raw_text.events.push(egui::Event::Text("shannon".to_string()));
+        let _ = ctx.run(raw_text, |c| app.update_ui(c));
+        assert_eq!(app.filter_text, "shannon");
     }
 }
