@@ -391,17 +391,17 @@ fn cs_bin_nodes(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ext = max(sim.world_extent, 0.5);
     let norm = clamp((p + vec2<f32>(ext, ext)) / (2.0 * ext), vec2<f32>(0.0, 0.0), vec2<f32>(0.9999, 0.9999));
 
+    let fine_per_super = max(sim.grid_dim / max(sim.super_dim, 1u), 1u);
     let gdim_f = f32(sim.grid_dim);
-    let gx = u32(norm.x * gdim_f);
-    let gy = u32(norm.y * gdim_f);
+    let gx = min(u32(norm.x * gdim_f), sim.grid_dim - 1u);
+    let gy = min(u32(norm.y * gdim_f), sim.grid_dim - 1u);
     let cell = gy * sim.grid_dim + gx;
 
     let prev = atomicExchange(&cell_head[cell], i32(i));
     node_next[i] = prev;
 
-    let sdim_f = f32(sim.super_dim);
-    let sx = u32(norm.x * sdim_f);
-    let sy = u32(norm.y * sdim_f);
+    let sx = min(gx / fine_per_super, sim.super_dim - 1u);
+    let sy = min(gy / fine_per_super, sim.super_dim - 1u);
     let sc_base = (sy * sim.super_dim + sx) * 3u;
 
     let charge = clamp(sqrt(nodes[i].degree + 1.0), 1.0, 24.0);
@@ -433,25 +433,25 @@ fn cs_forces_and_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let ext = max(sim.world_extent, 0.5);
     let norm = clamp((pos_i + vec2<f32>(ext, ext)) / (2.0 * ext), vec2<f32>(0.0, 0.0), vec2<f32>(0.9999, 0.9999));
-    let gx_i = i32(u32(norm.x * f32(sim.grid_dim)));
-    let gy_i = i32(u32(norm.y * f32(sim.grid_dim)));
-    let sx_i = i32(u32(norm.x * f32(sim.super_dim)));
-    let sy_i = i32(u32(norm.y * f32(sim.super_dim)));
+    let fine_per_super = max(sim.grid_dim / max(sim.super_dim, 1u), 1u);
+    let gx_i = i32(min(u32(norm.x * f32(sim.grid_dim)), sim.grid_dim - 1u));
+    let gy_i = i32(min(u32(norm.y * f32(sim.grid_dim)), sim.grid_dim - 1u));
+    let sx_i = i32(min(u32(gx_i) / fine_per_super, sim.super_dim - 1u));
+    let sy_i = i32(min(u32(gy_i) / fine_per_super, sim.super_dim - 1u));
 
     var force = vec2<f32>(0.0, 0.0);
 
-    // 1. Exact short-range ForceAtlas2 repulsion across 3x3 fine spatial-hash neighborhood
+    // 1. Exact short-range ForceAtlas2 repulsion across the 3x3 supercell block
+    //    (aligned disjointly with the far-field multipole skip radius abs(dx)<=1 && abs(dy)<=1).
+    let sdim_i = i32(sim.super_dim);
+    let fps_i = i32(fine_per_super);
     let gdim_i = i32(sim.grid_dim);
-    for (var oy: i32 = -1; oy <= 1; oy = oy + 1) {
-        let ny = gy_i + oy;
-        if (ny < 0 || ny >= gdim_i) {
-            continue;
-        }
-        for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
-            let nx = gx_i + ox;
-            if (nx < 0 || nx >= gdim_i) {
-                continue;
-            }
+    let gx_lo = max((sx_i - 1) * fps_i, 0);
+    let gx_hi = min((sx_i + 2) * fps_i - 1, gdim_i - 1);
+    let gy_lo = max((sy_i - 1) * fps_i, 0);
+    let gy_hi = min((sy_i + 2) * fps_i - 1, gdim_i - 1);
+    for (var ny: i32 = gy_lo; ny <= gy_hi; ny = ny + 1) {
+        for (var nx: i32 = gx_lo; nx <= gx_hi; nx = nx + 1) {
             let c_idx = u32(ny) * sim.grid_dim + u32(nx);
             var cur = atomicLoad(&cell_head[c_idx]);
             var guard: u32 = 0u;
@@ -474,11 +474,10 @@ fn cs_forces_and_integrate(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // 2. Long-range 16x16 Barnes-Hut multipole supercell monopole repulsion
-    let sdim_i = i32(sim.super_dim);
+    // 2. Long-range 16x16 Barnes-Hut multipole supercell monopole repulsion (far-field |ds| > 1)
     for (var sy: i32 = 0; sy < sdim_i; sy = sy + 1) {
         for (var sx: i32 = 0; sx < sdim_i; sx = sx + 1) {
-            if (abs(sx - sx_i) <= 0 && abs(sy - sy_i) <= 0) {
+            if (abs(sx - sx_i) <= 1 && abs(sy - sy_i) <= 1) {
                 continue;
             }
             let sc_base = (u32(sy) * sim.super_dim + u32(sx)) * 3u;
@@ -581,21 +580,19 @@ fn unpack_rgba(c: u32) -> vec4<f32> {
 }
 
 fn world_to_ndc(w: vec2<f32>) -> vec2<f32> {
-    let half_w = cam.viewport_w * 0.44 * cam.zoom;
-    let half_h = cam.viewport_h * 0.44 * cam.zoom;
-    let sx = cam.viewport_w * 0.5 + cam.pan_x + w.x * half_w;
-    let sy = cam.viewport_h * 0.5 + cam.pan_y + w.y * half_h;
+    let half_s = min(cam.viewport_w, cam.viewport_h) * 0.44 * cam.zoom;
+    let sx = cam.viewport_w * 0.5 + cam.pan_x + w.x * half_s;
+    let sy = cam.viewport_h * 0.5 + cam.pan_y + w.y * half_s;
     let ndc_x = (sx / max(cam.viewport_w, 1.0)) * 2.0 - 1.0;
     let ndc_y = 1.0 - (sy / max(cam.viewport_h, 1.0)) * 2.0;
     return vec2<f32>(ndc_x, ndc_y);
 }
 
 fn world_to_px(w: vec2<f32>) -> vec2<f32> {
-    let half_w = cam.viewport_w * 0.44 * cam.zoom;
-    let half_h = cam.viewport_h * 0.44 * cam.zoom;
+    let half_s = min(cam.viewport_w, cam.viewport_h) * 0.44 * cam.zoom;
     return vec2<f32>(
-        cam.viewport_w * 0.5 + cam.pan_x + w.x * half_w,
-        cam.viewport_h * 0.5 + cam.pan_y + w.y * half_h
+        cam.viewport_w * 0.5 + cam.pan_x + w.x * half_s,
+        cam.viewport_h * 0.5 + cam.pan_y + w.y * half_s
     );
 }
 
@@ -611,6 +608,7 @@ struct EdgeVaryings {
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) seg_len_px: f32,
+    @location(3) stroke_half_w: f32,
 };
 
 @vertex
@@ -628,6 +626,7 @@ fn vs_edge(
         out.color = vec4<f32>(0.0);
         out.uv = vec2<f32>(0.0);
         out.seg_len_px = 0.0;
+        out.stroke_half_w = 0.0;
         return out;
     }
 
@@ -635,24 +634,35 @@ fn vs_edge(
     let t_node = nodes[e.dst_idx];
     let p1 = world_to_px(s_node.pos);
     let p2 = world_to_px(t_node.pos);
-    let delta = p2 - p1;
-    let len_px = length(delta);
+    let full_delta = p2 - p1;
+    let full_len = length(full_delta);
+    let zoom_sqrt = sqrt(clamp(cam.zoom, 0.25, 5.0));
+    let tgt_r_px = clamp(t_node.radius * cam.node_scale * zoom_sqrt, 1.65, 30.0);
+    let src_r_px = clamp(s_node.radius * cam.node_scale * zoom_sqrt, 1.65, 30.0);
 
-    if (len_px < 1.5) {
+    if (full_len < max(src_r_px * 0.4 + tgt_r_px + 3.0, 2.5)) {
         out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
         out.color = vec4<f32>(0.0);
         out.uv = vec2<f32>(0.0);
         out.seg_len_px = 0.0;
+        out.stroke_half_w = 0.0;
         return out;
     }
 
-    let dir = delta / len_px;
+    let dir = full_delta / full_len;
     let nrm = vec2<f32>(-dir.y, dir.x);
+    let p_end = p2 - dir * (tgt_r_px + 2.0);
+    let seg_len = length(p_end - p1);
     let base_col = unpack_rgba(e.rgba_packed);
 
     let both_spot = ((s_node.flags & 32u) != 0u) && ((t_node.flags & 32u) != 0u);
     let alpha_boost = select(0.14, 1.0, both_spot);
-    let half_thick = select(0.85 + raw_eb * 2.2, 2.1, is_special) + f32(cam.curved_edges) * min(len_px * 0.06, 14.0);
+    let special_half = select(1.25, 1.60, e.eb_encoded >= 9.5);
+    let stroke_half_w = select(clamp(0.65 + raw_eb * 2.1, 0.65, 3.1), special_half, is_special);
+    let bow_amp = select(0.0, min(seg_len * 0.045, 11.0), cam.curved_edges == 1u);
+    let a_len = clamp(5.5 + stroke_half_w * 1.4, 6.0, 11.5);
+    let half_thick = max(stroke_half_w + 2.5, a_len * 0.65) + bow_amp;
+    let x_pad = 1.5;
 
     var quad_uv = vec2<f32>(0.0, 0.0);
     if (v_idx == 0u) { quad_uv = vec2<f32>(0.0, -1.0); }
@@ -662,31 +672,58 @@ fn vs_edge(
     else if (v_idx == 4u) { quad_uv = vec2<f32>(1.0, 1.0); }
     else { quad_uv = vec2<f32>(0.0, 1.0); }
 
-    let px_pos = p1 + dir * (quad_uv.x * len_px) + nrm * (quad_uv.y * half_thick);
+    let x_px = quad_uv.x * (seg_len + x_pad);
+    let y_px = quad_uv.y * half_thick;
+    let px_pos = p1 + dir * x_px + nrm * y_px;
     out.clip_pos = vec4<f32>(px_to_ndc(px_pos), 0.0, 1.0);
     out.color = vec4<f32>(
         base_col.rgb,
         clamp(base_col.a * cam.edge_alpha_scale * alpha_boost, 0.0, 0.96)
     );
-    out.uv = vec2<f32>(quad_uv.x, quad_uv.y * half_thick);
-    out.seg_len_px = len_px;
+    out.uv = vec2<f32>(x_px, y_px);
+    out.seg_len_px = seg_len;
+    out.stroke_half_w = stroke_half_w;
     return out;
 }
 
 @fragment
 fn fs_edge(in: EdgeVaryings) -> @location(0) vec4<f32> {
-    let bow_amp = select(0.0, min(in.seg_len_px * 0.045, 11.0), cam.curved_edges == 1u);
-    let center_y = 4.0 * bow_amp * in.uv.x * (1.0 - in.uv.x);
-    let dist_y = abs(in.uv.y - center_y);
-
-    var stroke_r = 0.78;
-    if (cam.show_arrows == 1u && in.seg_len_px > 26.0 && in.uv.x > 0.84 && in.uv.x < 0.96) {
-        let arrow_t = (0.96 - in.uv.x) / 0.12;
-        stroke_r = max(stroke_r, arrow_t * 3.4);
-    }
+    let seg_len = max(in.seg_len_px, 1.0);
+    let x_px = in.uv.x;
+    let t = clamp(x_px / seg_len, 0.0, 1.0);
+    let bow_amp = select(0.0, min(seg_len * 0.045, 11.0), cam.curved_edges == 1u);
+    let center_y = 4.0 * bow_amp * t * (1.0 - t);
+    let slope = 4.0 * bow_amp * (1.0 - 2.0 * t) / seg_len;
+    let dist_y = abs(in.uv.y - center_y) * inverseSqrt(1.0 + slope * slope);
 
     let aa = max(fwidth(dist_y), 0.45);
-    let cov = 1.0 - smoothstep(stroke_r - aa * 0.5, stroke_r + aa * 0.8, dist_y);
+    let a_len = clamp(5.5 + in.stroke_half_w * 1.4, 6.0, 11.5);
+    let show_arrow = (cam.show_arrows == 1u) && (seg_len > a_len + 4.0);
+
+    var cov = 0.0;
+    let end_cutoff = select(seg_len, seg_len - a_len * 0.35, show_arrow);
+    if (x_px >= 0.0 && x_px <= end_cutoff) {
+        cov = 1.0 - smoothstep(in.stroke_half_w - aa * 0.5, in.stroke_half_w + aa * 0.8, dist_y);
+    }
+
+    if (show_arrow) {
+        let end_slope = -4.0 * bow_amp / seg_len;
+        let tau = normalize(vec2<f32>(1.0, end_slope));
+        let nrm_t = vec2<f32>(-tau.y, tau.x);
+        let p_rel = vec2<f32>(x_px - seg_len, in.uv.y);
+        let along = -dot(p_rel, tau);
+        let perp = abs(dot(p_rel, nrm_t));
+        let a_half_w = a_len * 0.48;
+        if (along >= -aa && along <= a_len + aa) {
+            let tri_half = clamp(along / a_len, 0.0, 1.0) * a_half_w;
+            let d_side = (perp - tri_half) * 0.90;
+            let d_ends = max(-along, along - a_len);
+            let d_tri = max(d_side, d_ends);
+            let cov_arrow = 1.0 - smoothstep(-aa * 0.5, aa * 0.8, d_tri);
+            cov = max(cov, cov_arrow);
+        }
+    }
+
     let a = in.color.a * cov;
     if (a < 0.004) {
         discard;

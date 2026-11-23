@@ -107,7 +107,7 @@ pub fn compute_corpus_analytics(
         params.infomap_teleport,
     );
 
-    // 2. Guimera-Amaral (2005) (z_i, P_i) & Burt's Structural Hole Constraint C_i
+    // 2. Guimera-Amaral (2005) (z_i, P_i) & Exact Burt's Structural Hole Constraint C_i
     let mut within_deg = vec![0.0f64; n];
     let mut part_p = vec![0.0f64; n];
     let mut burt_c = vec![0.0f64; n];
@@ -133,22 +133,73 @@ pub fn compute_corpus_analytics(
         part_p[i] = (1.0 - sum_sq).max(0.0);
 
         let pij = 1.0 / (ki as f64);
-        if ki > 96 {
-            burt_c[i] = (pij * 1.35).min(1.0);
+        let mut nbr_pos: HashMap<usize, usize> = HashMap::with_capacity(ki);
+        for (pos, &j) in nbrs.iter().enumerate() {
+            nbr_pos.insert(j, pos);
+        }
+        let mut indirect = vec![0.0f64; ki];
+
+        // Compute exact Burt indirect constraint in O(sum_q min(k_i, k_q)); only stride-sample
+        // extreme dense hubs whose triangle-intersection work exceeds 250k checks.
+        let min_deg_work: usize = if ki > 512 {
+            nbrs.iter().map(|&q| ki.min(undir_adj[q].len())).sum()
         } else {
-            let mut c_sum = 0.0;
-            for &j in nbrs {
-                let mut indirect = 0.0;
-                for &q in nbrs {
-                    if q != j && undir_sets[q].contains(&j) {
-                        indirect += pij * (1.0 / (undir_adj[q].len().max(1) as f64));
+            0
+        };
+        if ki > 512 && min_deg_work > 250_000 {
+            let sample_m = 256usize.min(ki);
+            let scale = (ki as f64) / (sample_m as f64);
+            for s_idx in 0..sample_m {
+                let q_pos = (s_idx * ki + ki / 2) / sample_m;
+                let q = nbrs[q_pos];
+                let kq = undir_adj[q].len().max(1) as f64;
+                let w_iq_pq = (pij / kq) * scale;
+                if undir_adj[q].len() < ki {
+                    for &w in &undir_adj[q] {
+                        if w != q {
+                            if let Some(&j_pos) = nbr_pos.get(&w) {
+                                indirect[j_pos] += w_iq_pq;
+                            }
+                        }
+                    }
+                } else {
+                    for (j_pos, &j) in nbrs.iter().enumerate() {
+                        if j != q && undir_sets[q].contains(&j) {
+                            indirect[j_pos] += w_iq_pq;
+                        }
                     }
                 }
-                let term = pij + indirect;
-                c_sum += term * term;
             }
-            burt_c[i] = c_sum.min(1.25);
+        } else {
+            for &q in nbrs {
+                let kq = undir_adj[q].len().max(1) as f64;
+                let w_iq_pq = pij / kq;
+                if undir_adj[q].len() < ki {
+                    for &w in &undir_adj[q] {
+                        if w != q {
+                            if let Some(&j_pos) = nbr_pos.get(&w) {
+                                indirect[j_pos] += w_iq_pq;
+                            }
+                        }
+                    }
+                } else {
+                    for (j_pos, &j) in nbrs.iter().enumerate() {
+                        if j != q && undir_sets[q].contains(&j) {
+                            indirect[j_pos] += w_iq_pq;
+                        }
+                    }
+                }
+            }
         }
+
+        let c_sum: f64 = indirect
+            .iter()
+            .map(|&ind| {
+                let term = pij + ind;
+                term * term
+            })
+            .sum();
+        burt_c[i] = c_sum;
     }
 
     let mut within_z = vec![0.0f64; n];
@@ -209,8 +260,13 @@ pub fn compute_corpus_analytics(
 
             for &citer_idx in &in_adj[i] {
                 let c_yr = active_records[citer_idx].year;
-                let t_age = (c_yr - pub_yr).clamp(0, (age_len - 1) as i32) as usize;
-                annual_counts[t_age] += 1.0;
+                if c_yr <= 0 || c_yr < pub_yr || c_yr > horizon {
+                    continue;
+                }
+                let t_age = (c_yr - pub_yr) as usize;
+                if t_age < age_len {
+                    annual_counts[t_age] += 1.0;
+                }
             }
 
             let mut v_win_series = vec![0.0f64; year_span];
@@ -756,29 +812,38 @@ fn run_parallel_brandes(
         return (Vec::new(), HashMap::new());
     }
 
-    let sources: Vec<usize> = if n <= PIVOT_BRANDES_THRESHOLD {
-        (0..n).collect()
+    // Horvitz-Thompson stratified pivot estimator O(K * (V + E)):
+    // Deterministic top-H hub pivots have inclusion probability 1.0 (weight 1.0);
+    // uniform non-hub pivots sampled from the remaining (n - H) vertices carry weight (n - H) / (K - H).
+    let weighted_sources: Vec<(usize, f64)> = if n <= PIVOT_BRANDES_THRESHOLD {
+        (0..n).map(|s| (s, 1.0)).collect()
     } else {
-        // Stratified hub + deterministic uniform pivot estimator O(K * (V + E))
         let mut by_deg: Vec<usize> = (0..n).collect();
-        by_deg.sort_by_key(|&u| std::cmp::Reverse(adj[u].len()));
-        let mut piv_set: HashSet<usize> = by_deg.into_iter().take(64).collect();
-        let stride = (n / (PIVOT_SAMPLE_K - 64).max(1)).max(1);
-        let mut idx = 0usize;
-        while piv_set.len() < PIVOT_SAMPLE_K.min(n) && idx < n {
-            piv_set.insert(idx);
-            idx += stride;
+        by_deg.sort_by(|&a, &b| adj[b].len().cmp(&adj[a].len()).then_with(|| a.cmp(&b)));
+        let hub_count = 64usize.min(n);
+        let target_k = PIVOT_SAMPLE_K.min(n);
+        let non_hub_pool = &by_deg[hub_count..];
+        let non_hub_n = non_hub_pool.len();
+        let non_hub_sample = target_k.saturating_sub(hub_count).min(non_hub_n);
+
+        let mut sources = Vec::with_capacity(hub_count + non_hub_sample);
+        for &u in &by_deg[..hub_count] {
+            sources.push((u, 1.0));
         }
-        let mut v: Vec<usize> = piv_set.into_iter().collect();
-        v.sort_unstable();
-        v
+        if non_hub_sample > 0 {
+            let ht_weight = (non_hub_n as f64) / (non_hub_sample as f64);
+            for j in 0..non_hub_sample {
+                let pos = (j * non_hub_n + non_hub_n / 2) / non_hub_sample;
+                sources.push((non_hub_pool[pos], ht_weight));
+            }
+        }
+        sources
     };
-    let pivot_scale = (n as f64) / (sources.len().max(1) as f64);
     let collect_edge_eb = n <= 8_000;
 
-    let partials: Vec<(Vec<f64>, Vec<((usize, usize), f64)>)> = sources
+    let partials: Vec<(Vec<f64>, Vec<((usize, usize), f64)>, f64)> = weighted_sources
         .into_par_iter()
-        .map(|s| {
+        .map(|(s, weight)| {
             let mut stack = Vec::with_capacity(n);
             let mut pred = vec![Vec::<usize>::new(); n];
             let mut sigma = vec![0.0f64; n];
@@ -824,33 +889,31 @@ fn run_parallel_brandes(
                 }
             }
 
-            (local_cb, local_eb)
+            (local_cb, local_eb, weight)
         })
         .collect();
 
     let mut cb = vec![0.0f64; n];
     let mut eb: HashMap<(usize, usize), f64> = HashMap::new();
-    for (l_cb, l_eb) in partials {
+    for (l_cb, l_eb, weight) in partials {
         for (i, val) in l_cb.into_iter().enumerate() {
-            cb[i] += val;
+            cb[i] += val * weight;
         }
         for (k, val) in l_eb {
-            *eb.entry(k).or_insert(0.0) += val;
+            *eb.entry(k).or_insert(0.0) += val * weight;
         }
     }
 
     let denom = ((n.saturating_sub(1) as f64) * (n.saturating_sub(2) as f64)).max(1.0);
     for val in &mut cb {
-        let scaled = *val * pivot_scale;
         *val = if directed {
-            scaled / denom
+            *val / denom
         } else {
-            (scaled / 2.0) / ((denom / 2.0).max(1.0))
+            (*val / 2.0) / ((denom / 2.0).max(1.0))
         };
     }
-    for val in eb.values_mut() {
-        *val *= pivot_scale;
-        if !directed {
+    if !directed {
+        for val in eb.values_mut() {
             *val /= 2.0;
         }
     }
@@ -1815,5 +1878,99 @@ mod cd5_hits_tests {
             assert!((pm.hits_hub - hh[i]).abs() < 1e-12);
             assert!((pm.hits_authority - aa[i]).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn stratified_brandes_barbell_1600_bridge_accuracy_within_5pct() {
+        let n = 1_600usize;
+        let mut adj = vec![Vec::<usize>::new(); n];
+        let mut add_edge = |u: usize, v: usize| {
+            adj[u].push(v);
+            adj[v].push(u);
+        };
+        // Cluster A: star centered at 0 across 0..799 (799 nodes)
+        for u in 1..799 {
+            add_edge(0, u);
+        }
+        // Cluster B: star centered at 799 across 799..1598 (799 nodes)
+        for u in 800..1598 {
+            add_edge(799, u);
+        }
+        // 2-node bridge: 0 -- 1598 -- 1599 -- 799
+        add_edge(0, 1598);
+        add_edge(1598, 1599);
+        add_edge(1599, 799);
+
+        let (cb, _) = run_parallel_brandes(n, &adj, false);
+        let denom = ((n - 1) * (n - 2)) as f64 / 2.0;
+
+        let exact_bridge = (799.0 * 800.0) / denom;
+        let err_b1 = ((cb[1598] - exact_bridge) / exact_bridge).abs();
+        let err_b2 = ((cb[1599] - exact_bridge) / exact_bridge).abs();
+        assert!(
+            err_b1 < 0.05 && err_b2 < 0.05,
+            "Bridge node error exceeded 5%: cb[1598]={} cb[1599]={} exact={}",
+            cb[1598],
+            cb[1599],
+            exact_bridge
+        );
+
+        let exact_hub = (798.0 * 797.0 / 2.0 + 798.0 * 801.0) / denom;
+        let err_h1 = ((cb[0] - exact_hub) / exact_hub).abs();
+        let err_h2 = ((cb[799] - exact_hub) / exact_hub).abs();
+        assert!(
+            err_h1 < 0.05 && err_h2 < 0.05,
+            "Hub bridge error exceeded 5%: cb[0]={} cb[799]={} exact={}",
+            cb[0],
+            cb[799],
+            exact_hub
+        );
+    }
+
+    #[test]
+    fn pre_pub_citations_excluded_from_annual_counts_and_burt_c_exact_for_hubs() {
+        // 1. Pre-publication citation (c_yr < pub_yr) must not pollute annual_counts[0]
+        let papers = vec![
+            mk_node("pre_citer", 2010),
+            mk_node("focal", 2015),
+            mk_node("c0", 2015),
+            mk_node("c5", 2020),
+        ];
+        let edges = vec![
+            edge("pre_citer", "focal"),
+            edge("c0", "focal"),
+            edge("c5", "focal"),
+        ];
+        let analytics = compute_corpus_analytics(&papers, &edges, &AnalyticsParams::default());
+        let focal = analytics.papers.iter().find(|p| p.record.id == "focal").unwrap();
+        assert!(
+            (focal.annual_counts[0] - 1.0).abs() < 1e-12,
+            "Expected annual_counts[0] == 1.0 (pre-pub excluded), got {}",
+            focal.annual_counts[0]
+        );
+
+        // 2. Hub with degree > 96 computes exact Burt C_i (not (1/k)*1.35 placeholder)
+        let k = 100usize;
+        let n_hub = k + 1;
+        let mut hub_papers = Vec::with_capacity(n_hub);
+        let mut hub_edges = Vec::new();
+        for idx in 0..n_hub {
+            hub_papers.push(mk_node(&format!("h{}", idx), 2020));
+        }
+        for i in 0..n_hub {
+            for j in (i + 1)..n_hub {
+                hub_edges.push(edge(&format!("h{}", i), &format!("h{}", j)));
+            }
+        }
+        let hub_analytics =
+            compute_corpus_analytics(&hub_papers, &hub_edges, &AnalyticsParams::default());
+        let expected_c = (k as f64) * ((1.0 / k as f64) + ((k - 1) as f64) / ((k * k) as f64)).powi(2);
+        assert!(
+            (hub_analytics.papers[0].burt_c - expected_c).abs() < 1e-9,
+            "Expected exact Burt C_i={} for k={}, got {}",
+            expected_c,
+            k,
+            hub_analytics.papers[0].burt_c
+        );
     }
 }

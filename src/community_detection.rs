@@ -390,6 +390,42 @@ pub fn run_louvain_modularity(
 // 2. RANDOM-WALK INFOMAP FLOW COMPRESSION (Rosvall & Bergstrom 2008)
 // ============================================================================
 
+/// Builds the effective Infomap random-walk transition graph:
+/// directed citation edges (`1.0`) supplemented with `0.25` back-flow strictly
+/// from reverse `in_adj` directed edges.
+pub fn build_infomap_rw_transitions(out_adj: &[Vec<usize>]) -> (Vec<Vec<(usize, f64)>>, Vec<f64>) {
+    let n = out_adj.len();
+    let mut in_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (u, nbrs) in out_adj.iter().enumerate() {
+        for &v in nbrs {
+            if u != v && v < n {
+                in_adj[v].push(u);
+            }
+        }
+    }
+
+    let mut rw_out: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    let mut rw_out_sum = vec![0.0f64; n];
+    for u in 0..n {
+        let mut weights: HashMap<usize, f64> = HashMap::new();
+        for &v in &out_adj[u] {
+            if u != v && v < n {
+                *weights.entry(v).or_insert(0.0) += 1.0;
+            }
+        }
+        for &v in &in_adj[u] {
+            if u != v {
+                *weights.entry(v).or_insert(0.0) += 0.25;
+            }
+        }
+        let mut list: Vec<(usize, f64)> = weights.into_iter().collect();
+        list.sort_unstable_by_key(|&(v, _)| v);
+        rw_out_sum[u] = list.iter().map(|&(_, w)| w).sum();
+        rw_out[u] = list;
+    }
+    (rw_out, rw_out_sum)
+}
+
 /// Computes ergodic PageRank visit frequencies and optimizes the two-level
 /// Rosvall-Bergstrom Map Equation description length L(M) in bits per step.
 pub fn run_infomap_compression(
@@ -418,29 +454,7 @@ pub fn run_infomap_compression(
         };
     }
 
-    // Build effective random-walk transition graph:
-    // Use directed citation edges supplemented with weak bidirectional epistemic back-flow (0.25)
-    // so citing-to-cited lineages trap probability flow inside coherent research fronts rather
-    // than collapsing all mass solely onto 1948/1955 sink roots.
-    let mut rw_out: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
-    let mut rw_out_sum = vec![0.0f64; n];
-    for u in 0..n {
-        let mut weights: HashMap<usize, f64> = HashMap::new();
-        for &v in &out_adj[u] {
-            if u != v {
-                *weights.entry(v).or_insert(0.0) += 1.0;
-            }
-        }
-        for &v in &undir_adj[u] {
-            if u != v {
-                *weights.entry(v).or_insert(0.0) += 0.35;
-            }
-        }
-        let mut list: Vec<(usize, f64)> = weights.into_iter().collect();
-        list.sort_unstable_by_key(|&(v, _)| v);
-        rw_out_sum[u] = list.iter().map(|&(_, w)| w).sum();
-        rw_out[u] = list;
-    }
+    let (rw_out, rw_out_sum) = build_infomap_rw_transitions(out_adj);
 
     // Step 1: Power iteration for exact ergodic stationary distribution p_i
     let inv_n = 1.0 / (n as f64);
@@ -1223,4 +1237,37 @@ fn summarize_clusters(
         .collect();
 
     (clusters, contingency)
+}
+
+#[cfg(test)]
+mod infomap_flow_tests {
+    use super::*;
+
+    #[test]
+    fn infomap_forward_backward_transition_ratio_on_abc_is_exact_1_to_025() {
+        // Directed chain: A (0) -> B (1) -> C (2)
+        let out_adj = vec![vec![1], vec![2], vec![]];
+        let undir_adj = vec![vec![1], vec![0, 2], vec![1]];
+        let (rw_out, _) = build_infomap_rw_transitions(&out_adj);
+
+        let w_b_to_c = rw_out[1].iter().find(|&&(v, _)| v == 2).map(|&(_, w)| w).unwrap();
+        let w_b_to_a = rw_out[1].iter().find(|&&(v, _)| v == 0).map(|&(_, w)| w).unwrap();
+        assert!((w_b_to_c - 1.0).abs() < 1e-12, "B->C weight={}", w_b_to_c);
+        assert!((w_b_to_a - 0.25).abs() < 1e-12, "B->A back-flow={}", w_b_to_a);
+        assert!((w_b_to_c / w_b_to_a - 4.0).abs() < 1e-12);
+
+        let discs = [Discipline::INF, Discipline::INF, Discipline::INF];
+        let ids = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let cb = vec![0.0, 1.0, 0.0];
+        let tau = 0.15;
+        let res = run_infomap_compression(&out_adj, &undir_adj, &discs, &ids, &cb, tau);
+        let p = &res.stationary_flow;
+        // On A -> B -> C with no dangling nodes, excess flow arriving at C vs A from B is exact 1.0 : 0.25.
+        let flow_ratio = (p[2] - tau / 3.0) / (p[0] - tau / 3.0);
+        assert!(
+            (flow_ratio - 4.0).abs() < 1e-9,
+            "Expected exact 1.0:0.25 (=4.0) forward/backward flow ratio, got {}",
+            flow_ratio
+        );
+    }
 }

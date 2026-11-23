@@ -219,6 +219,8 @@ pub struct CitAtlasApp {
     pub audit_outcome_filter: AuditOutcomeFilter,
     pub audit_search_query: String,
     pub custom_domain_input: String,
+    pub pending_params_recompute: bool,
+    pub last_graph_viewport_size: Vec2,
 
     worker_tx: Sender<WorkerEvent>,
     worker_rx: Receiver<WorkerEvent>,
@@ -364,6 +366,8 @@ impl CitAtlasApp {
             audit_outcome_filter: AuditOutcomeFilter::All,
             audit_search_query: String::new(),
             custom_domain_input: String::new(),
+            pending_params_recompute: false,
+            last_graph_viewport_size: Vec2::new(960.0, 640.0),
             worker_tx,
             worker_rx,
         };
@@ -416,6 +420,146 @@ impl CitAtlasApp {
         self.graph_viewer.sync_with_analytics(&self.analytics, &self.focused_paper_id);
         self.rebuild_cpu_pick_grid();
         self.bump_gpu_revision();
+    }
+
+    pub fn fit_graph_to_viewport(&mut self) {
+        self.net_pan = Vec2::ZERO;
+        self.net_zoom = 1.0;
+
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut count = 0usize;
+
+        if self.use_wgpu_pipeline {
+            if let Ok(mir) = self.gpu_mirror.lock() {
+                for &[x, y] in mir.coords.iter().take(self.analytics.papers.len()) {
+                    if x.is_finite() && y.is_finite() {
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        if count == 0 {
+            for p in &self.analytics.papers {
+                if let Some(&[x, y]) = self.graph_viewer.positions.get(&p.record.id) {
+                    if x.is_finite() && y.is_finite() {
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        if count == 0 {
+            self.graph_viewer.pan = [0.0, 0.0];
+            self.graph_viewer.zoom = 1.0;
+            return;
+        }
+
+        let cx = 0.5 * (min_x + max_x);
+        let cy = 0.5 * (min_y + max_y);
+        let half_span = (0.5 * (max_x - min_x).max(max_y - min_y)).max(0.12);
+        let zoom = (0.92 / half_span).clamp(0.25, 6.0);
+        let min_dim = self
+            .last_graph_viewport_size
+            .x
+            .min(self.last_graph_viewport_size.y)
+            .max(240.0);
+        let half_s = min_dim * 0.44 * zoom;
+        self.graph_viewer.zoom = zoom;
+        self.graph_viewer.pan = [-cx * half_s, -cy * half_s];
+    }
+
+    pub fn reset_all_filters(&mut self) {
+        let max_raw_year = self
+            .raw_papers
+            .iter()
+            .map(|p| p.year)
+            .max()
+            .unwrap_or(2026);
+        self.params.horizon_year = AnalyticsParams::default().horizon_year.max(max_raw_year);
+        self.params.exclude_retracted = false;
+        self.disc_filter = None;
+        self.filter_text.clear();
+        self.pop_year_min_input.clear();
+        self.pop_year_max_input.clear();
+        self.graph_viewer.ego_mode = EgoSpotlightMode::FullGraph;
+        self.graph_viewer.min_edge_eb = 0.0;
+        self.pending_params_recompute = false;
+        self.recompute_all();
+        self.fit_graph_to_viewport();
+        self.status_banner = format!(
+            "Filters reset — showing {} active papers across {} edges.",
+            self.analytics.papers.len(),
+            self.analytics.active_edges.len()
+        );
+    }
+
+    fn render_empty_graph_state(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+    ) {
+        let box_w = 460.0f32.min((rect.width() - 32.0).max(260.0));
+        let box_h = 152.0f32;
+        let card_rect = Rect::from_center_size(rect.center(), Vec2::new(box_w, box_h));
+        painter.rect_filled(card_rect, 8.0, Color32::from_rgba_unmultiplied(15, 23, 42, 240));
+        painter.rect_stroke(
+            card_rect,
+            8.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(56, 189, 248)),
+            egui::StrokeKind::Inside,
+        );
+
+        let inner = card_rect.shrink(14.0);
+        let mut child_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        child_ui.label(
+            RichText::new("No Active Papers Match Current Filters (n = 0)")
+                .size(14.5)
+                .strong()
+                .color(Color32::from_rgb(248, 250, 252)),
+        );
+        child_ui.add_space(4.0);
+        let diag = if self.raw_papers.is_empty() {
+            "Raw corpus is empty. Load a dataset in Tab 1 (Literature Search) or Tab 8 (SQLite & CSV).".to_string()
+        } else {
+            format!(
+                "{} raw papers loaded, all excluded by Horizon <= {}{}.",
+                self.raw_papers.len(),
+                self.params.horizon_year,
+                if self.params.exclude_retracted {
+                    " + Hide Retracted"
+                } else {
+                    ""
+                }
+            )
+        };
+        child_ui.label(RichText::new(diag).size(12.0).color(Color32::from_rgb(148, 163, 184)));
+        child_ui.add_space(10.0);
+        if child_ui
+            .button(
+                RichText::new("Reset Filters")
+                    .strong()
+                    .color(Color32::from_rgb(15, 23, 42)),
+            )
+            .clicked()
+        {
+            self.reset_all_filters();
+        }
     }
 
     fn bump_gpu_revision(&mut self) {
@@ -1127,6 +1271,48 @@ impl CitAtlasApp {
         let focus_filter_shortcut =
             ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::F));
 
+        if !ctx.wants_keyboard_input() {
+            let (tab_hotkey, toggle_physics, fit_camera) = ctx.input(|i| {
+                let no_mods = !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command;
+                if !no_mods {
+                    return (None, false, false);
+                }
+                let tab = if i.key_pressed(egui::Key::Num1) {
+                    Some(ActiveDomain::SearchAndDownload)
+                } else if i.key_pressed(egui::Key::Num2) {
+                    Some(ActiveDomain::NetworkGraphViewer)
+                } else if i.key_pressed(egui::Key::Num3) {
+                    Some(ActiveDomain::Observatory)
+                } else if i.key_pressed(egui::Key::Num4) {
+                    Some(ActiveDomain::VelocityAndAwakening)
+                } else if i.key_pressed(egui::Key::Num5) {
+                    Some(ActiveDomain::BridgeCartography)
+                } else if i.key_pressed(egui::Key::Num6) {
+                    Some(ActiveDomain::CommunitiesLouvainInfomap)
+                } else if i.key_pressed(egui::Key::Num7) {
+                    Some(ActiveDomain::TopicDriftMiJsd)
+                } else if i.key_pressed(egui::Key::Num8) {
+                    Some(ActiveDomain::LedgerAndLab)
+                } else if i.key_pressed(egui::Key::Num9) {
+                    Some(ActiveDomain::RateLimiterAndAudit)
+                } else {
+                    None
+                };
+                let phys = i.key_pressed(egui::Key::Space);
+                let fit = i.key_pressed(egui::Key::Num0) || i.key_pressed(egui::Key::R);
+                (tab, phys, fit)
+            });
+            if let Some(dom) = tab_hotkey {
+                self.domain = dom;
+            }
+            if toggle_physics {
+                self.graph_viewer.physics_running = !self.graph_viewer.physics_running;
+            }
+            if fit_camera {
+                self.fit_graph_to_viewport();
+            }
+        }
+
         // Top Navigation & Global Parameter Ribbon
         egui::TopBottomPanel::top("cit_atlas_top_ribbon").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1160,41 +1346,53 @@ impl CitAtlasApp {
 
             ui.separator();
 
-            // Global Sliders & Discipline Filter Pills
+            // Global Sliders & Discipline Filter Pills (debounced on drag_stopped() || lost_focus())
             let mut changed = false;
             ui.horizontal_wrapped(|ui| {
                 ui.label("W (yr):");
-                if ui
+                let w_resp = ui
                     .add(egui::Slider::new(&mut self.params.window_width, 3..=25))
-                    .on_hover_text("Sliding time-window width W (years) for temporal community drift (NMI/JSD) and mutual information.")
-                    .changed()
-                {
+                    .on_hover_text("Sliding time-window width W (years) for temporal community drift (NMI/JSD) and mutual information (updates on release).");
+                if w_resp.changed() {
+                    self.pending_params_recompute = true;
+                }
+                if (w_resp.drag_stopped() || w_resp.lost_focus()) && self.pending_params_recompute {
                     changed = true;
                 }
+
                 ui.label("Stride S:");
-                if ui
+                let s_resp = ui
                     .add(egui::Slider::new(&mut self.params.window_stride, 1..=10))
-                    .on_hover_text("Step stride S (years) between consecutive sliding time windows in Topic Drift (MI & JSD).")
-                    .changed()
-                {
+                    .on_hover_text("Step stride S (years) between consecutive sliding time windows in Topic Drift (MI & JSD) (updates on release).");
+                if s_resp.changed() {
+                    self.pending_params_recompute = true;
+                }
+                if (s_resp.drag_stopped() || s_resp.lost_focus()) && self.pending_params_recompute {
                     changed = true;
                 }
+
                 ui.label("Half-life tau:");
-                if ui
+                let tau_resp = ui
                     .add(egui::Slider::new(&mut self.params.half_life, 2.0..=20.0))
-                    .on_hover_text("Exponential citation-decay half-life tau (years) for instantaneous citation velocity v_exp.")
-                    .changed()
-                {
+                    .on_hover_text("Exponential citation-decay half-life tau (years) for instantaneous citation velocity v_exp (updates on release).");
+                if tau_resp.changed() {
+                    self.pending_params_recompute = true;
+                }
+                if (tau_resp.drag_stopped() || tau_resp.lost_focus()) && self.pending_params_recompute {
                     changed = true;
                 }
+
                 ui.label("Horizon:");
-                if ui
+                let hor_resp = ui
                     .add(egui::Slider::new(&mut self.params.horizon_year, 1965..=2026))
-                    .on_hover_text("Upper publication & citation cutoff year (Horizon) applied across all graph, velocity, and PoP metrics.")
-                    .changed()
-                {
+                    .on_hover_text("Upper publication & citation cutoff year (Horizon) applied across all graph, velocity, and PoP metrics (updates on release).");
+                if hor_resp.changed() {
+                    self.pending_params_recompute = true;
+                }
+                if (hor_resp.drag_stopped() || hor_resp.lost_focus()) && self.pending_params_recompute {
                     changed = true;
                 }
+
                 if ui
                     .checkbox(&mut self.params.exclude_retracted, "Hide Retracted")
                     .on_hover_text("Exclude retracted or withdrawn papers from active analytics, graph views, and PoP metrics.")
@@ -1249,6 +1447,7 @@ impl CitAtlasApp {
                 }
             });
             if changed {
+                self.pending_params_recompute = false;
                 self.recompute_all();
             }
             ui.add_space(2.0);
@@ -2244,8 +2443,7 @@ impl CitAtlasApp {
                 );
             }
             if ui.button("Fit View").clicked() {
-                self.graph_viewer.pan = [0.0, 0.0];
-                self.graph_viewer.zoom = 1.0;
+                self.fit_graph_to_viewport();
             }
             if !self.focused_paper_id.is_empty() {
                 let is_pinned = self.graph_viewer.pinned_ids.contains(&self.focused_paper_id);
@@ -2500,6 +2698,7 @@ impl CitAtlasApp {
         let desired = Vec2::new(avail.x.max(320.0), (avail.y - 4.0).max(360.0));
         let (resp, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
         let rect = resp.rect;
+        self.last_graph_viewport_size = rect.size();
 
         painter.rect_filled(rect, 6.0, Color32::from_rgb(7, 11, 21));
         painter.rect_stroke(
@@ -2511,6 +2710,7 @@ impl CitAtlasApp {
 
         let n = self.analytics.papers.len();
         if n == 0 {
+            self.render_empty_graph_state(ui, &painter, rect);
             return;
         }
 
@@ -2536,20 +2736,19 @@ impl CitAtlasApp {
             }
         }
 
-        let half_w = rect.width() * 0.44 * self.graph_viewer.zoom;
-        let half_h = rect.height() * 0.44 * self.graph_viewer.zoom;
+        let half_s = rect.width().min(rect.height()) * 0.44 * self.graph_viewer.zoom;
         let origin = Pos2::new(
             rect.center().x + self.graph_viewer.pan[0],
             rect.center().y + self.graph_viewer.pan[1],
         );
 
         let world_to_screen = |wx: f32, wy: f32| -> Pos2 {
-            Pos2::new(origin.x + wx * half_w, origin.y + wy * half_h)
+            Pos2::new(origin.x + wx * half_s, origin.y + wy * half_s)
         };
         let screen_to_world = |sp: Pos2| -> [f32; 2] {
             [
-                ((sp.x - origin.x) / half_w.max(1.0)).clamp(-1.18, 1.18),
-                ((sp.y - origin.y) / half_h.max(1.0)).clamp(-1.18, 1.18),
+                ((sp.x - origin.x) / half_s.max(1.0)).clamp(-1.18, 1.18),
+                ((sp.y - origin.y) / half_s.max(1.0)).clamp(-1.18, 1.18),
             ]
         };
 
@@ -2565,7 +2764,7 @@ impl CitAtlasApp {
             0
         };
         let total_vis_nodes = n + n_art_vis + n_bio_vis;
-        let pick_radius_world = (14.0 / half_w.min(half_h).max(12.0)).clamp(0.0025, 0.08);
+        let pick_radius_world = (14.0 / half_s.max(12.0)).clamp(0.0025, 0.08);
         let mut hovered_any_idx: Option<usize> = None;
         if let Some(pp) = pointer_pos {
             if rect.contains(pp) {
@@ -2961,9 +3160,9 @@ impl CitAtlasApp {
             }
             let vp_scale = (1.0 / self.graph_viewer.zoom).clamp(0.08, 1.0);
             let vp_cx = mm_rect.center().x
-                - (self.graph_viewer.pan[0] / half_w.max(1.0)) * (mm_w * 0.44);
+                - (self.graph_viewer.pan[0] / half_s.max(1.0)) * (mm_w * 0.44);
             let vp_cy = mm_rect.center().y
-                - (self.graph_viewer.pan[1] / half_h.max(1.0)) * (mm_h * 0.44);
+                - (self.graph_viewer.pan[1] / half_s.max(1.0)) * (mm_h * 0.44);
             let vp_rect = Rect::from_center_size(
                 Pos2::new(vp_cx, vp_cy),
                 Vec2::new(mm_w * 0.88 * vp_scale, mm_h * 0.88 * vp_scale),
@@ -3166,6 +3365,7 @@ impl CitAtlasApp {
         let desired = Vec2::new(avail.x.max(320.0), (avail.y - 4.0).max(360.0));
         let (resp, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
         let rect = resp.rect;
+        self.last_graph_viewport_size = rect.size();
 
         painter.rect_filled(rect, 6.0, Color32::from_rgb(8, 13, 24));
         painter.rect_stroke(
@@ -3177,13 +3377,7 @@ impl CitAtlasApp {
 
         let n = self.analytics.papers.len();
         if n == 0 {
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                "Corpus contains 0 active papers under current filter/horizon.",
-                FontId::proportional(13.0),
-                Color32::from_rgb(148, 163, 184),
-            );
+            self.render_empty_graph_state(ui, &painter, rect);
             return;
         }
 
@@ -3196,28 +3390,27 @@ impl CitAtlasApp {
             }
         }
 
-        let half_w = rect.width() * 0.44 * self.graph_viewer.zoom;
-        let half_h = rect.height() * 0.44 * self.graph_viewer.zoom;
+        let half_s = rect.width().min(rect.height()) * 0.44 * self.graph_viewer.zoom;
         let origin = Pos2::new(
             rect.center().x + self.graph_viewer.pan[0],
             rect.center().y + self.graph_viewer.pan[1],
         );
 
         let world_to_screen = |wx: f32, wy: f32| -> Pos2 {
-            Pos2::new(origin.x + wx * half_w, origin.y + wy * half_h)
+            Pos2::new(origin.x + wx * half_s, origin.y + wy * half_s)
         };
         let screen_to_world = |sp: Pos2| -> [f32; 2] {
             [
-                ((sp.x - origin.x) / half_w.max(1.0)).clamp(-0.96, 0.96),
-                ((sp.y - origin.y) / half_h.max(1.0)).clamp(-0.96, 0.96),
+                ((sp.x - origin.x) / half_s.max(1.0)).clamp(-0.96, 0.96),
+                ((sp.y - origin.y) / half_s.max(1.0)).clamp(-0.96, 0.96),
             ]
         };
 
         // Subtle coordinate grid
         for step in -2..=2 {
             let f = (step as f32) * 0.45;
-            let gx = origin.x + f * half_w;
-            let gy = origin.y + f * half_h;
+            let gx = origin.x + f * half_s;
+            let gy = origin.y + f * half_s;
             if gx > rect.left() && gx < rect.right() {
                 painter.line_segment(
                     [Pos2::new(gx, rect.top() + 2.0), Pos2::new(gx, rect.bottom() - 2.0)],
@@ -3757,9 +3950,9 @@ impl CitAtlasApp {
             }
             let vp_scale = (1.0 / self.graph_viewer.zoom).clamp(0.15, 1.0);
             let vp_cx = mm_rect.center().x
-                - (self.graph_viewer.pan[0] / half_w.max(1.0)) * (mm_w * 0.44);
+                - (self.graph_viewer.pan[0] / half_s.max(1.0)) * (mm_w * 0.44);
             let vp_cy = mm_rect.center().y
-                - (self.graph_viewer.pan[1] / half_h.max(1.0)) * (mm_h * 0.44);
+                - (self.graph_viewer.pan[1] / half_s.max(1.0)) * (mm_h * 0.44);
             let vp_rect = Rect::from_center_size(
                 Pos2::new(vp_cx, vp_cy),
                 Vec2::new(mm_w * 0.88 * vp_scale, mm_h * 0.88 * vp_scale),
@@ -7767,5 +7960,64 @@ mod tests {
         raw_text.events.push(egui::Event::Text("shannon".to_string()));
         let _ = ctx.run(raw_text, |c| app.update_ui(c));
         assert_eq!(app.filter_text, "shannon");
+    }
+
+    #[test]
+    fn headless_hotkeys_and_empty_state_reset_filters_work() {
+        let ctx = egui::Context::default();
+        let mut app = CitAtlasApp::new_with_ctx(&ctx, false, "test".to_string());
+
+        let step_key = |app: &mut CitAtlasApp, key: egui::Key| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(raw, |c| app.update_ui(c));
+        };
+
+        step_key(&mut app, egui::Key::Num2);
+        assert_eq!(app.domain, ActiveDomain::NetworkGraphViewer);
+        step_key(&mut app, egui::Key::Num6);
+        assert_eq!(app.domain, ActiveDomain::CommunitiesLouvainInfomap);
+        step_key(&mut app, egui::Key::Num2);
+        assert_eq!(app.domain, ActiveDomain::NetworkGraphViewer);
+
+        assert!(!app.graph_viewer.physics_running);
+        step_key(&mut app, egui::Key::Space);
+        assert!(app.graph_viewer.physics_running);
+        step_key(&mut app, egui::Key::Space);
+        assert!(!app.graph_viewer.physics_running);
+
+        app.graph_viewer.zoom = 3.5;
+        app.graph_viewer.pan = [120.0, -85.0];
+        step_key(&mut app, egui::Key::R);
+        assert!((app.graph_viewer.zoom - 1.0).abs() < 0.25);
+        assert!(app.graph_viewer.pan[0].abs() < 40.0 && app.graph_viewer.pan[1].abs() < 40.0);
+
+        app.params.horizon_year = 1940;
+        app.recompute_all();
+        assert_eq!(app.analytics.papers.len(), 0);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |c| app.update_ui(c),
+        );
+        app.reset_all_filters();
+        assert_eq!(app.analytics.papers.len(), 47);
     }
 }
