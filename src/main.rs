@@ -25,9 +25,10 @@ use cit_atlas::analytics::compute_corpus_analytics;
 use cit_atlas::corpus::{build_empirical_corpus, generate_synthetic_corpus};
 use cit_atlas::downloader::batch_download_corpus_pdfs;
 use cit_atlas::export::{
-    export_all_csv_suite, export_annual_trajectories_csv, export_bio_entity_bridges_csv, export_bundle_json,
-    export_crawl_audit_csv, export_domain_policies_csv,
-    export_communities_csv, export_edges_csv, export_gexf, export_graphml,
+    build_bibliometric_impact_digest, export_all_csv_suite, export_annual_trajectories_csv,
+    export_bio_entity_bridges_csv, export_bundle_json, export_communities_csv,
+    export_crawl_audit_csv, export_domain_policies_csv, export_edges_csv, export_gexf,
+    export_graphml, export_impact_digest_csv, export_impact_digest_json,
     export_integrity_and_datacite_csv, export_jsd_matrix_csv, export_metrics_csv,
     export_raw_papers_csv, export_synthesis_svg, export_topic_drift_csv,
 };
@@ -431,6 +432,27 @@ enum Commands {
 
         #[arg(long)]
         export_json: Option<PathBuf>,
+    },
+
+    /// Export comparative bibliometric impact digest (h-index, g-index, i10-index, PageRank, community modularity)
+    ImpactDigest {
+        #[arg(long)]
+        from_db: Option<PathBuf>,
+
+        #[arg(long)]
+        from_file: Option<PathBuf>,
+
+        #[arg(long, default_value_t = 2026)]
+        horizon: i32,
+
+        #[arg(long, default_value_t = false)]
+        exclude_retracted: bool,
+
+        #[arg(long)]
+        export_json: Option<PathBuf>,
+
+        #[arg(long)]
+        export_csv: Option<PathBuf>,
     },
 }
 
@@ -843,8 +865,11 @@ fn main() {
                     "communities" | "louvain" | "infomap" => {
                         export_communities_csv(&analytics, &target_path)
                     }
+                    "impact-digest" | "impact" | "digest" => {
+                        export_impact_digest_csv(&analytics, 2026, &target_path)
+                    }
                     other => Err(format!(
-                        "Unknown --table '{}'. Expected: all, metrics, raw, edges, bridges, trajectories, drift, jsd, or communities.",
+                        "Unknown --table '{}'. Expected: all, metrics, raw, edges, bridges, trajectories, drift, jsd, communities, or impact-digest.",
                         other
                     )),
                 };
@@ -1130,6 +1155,63 @@ fn main() {
             }
             if let Some(ref json_p) = export_json {
                 export_bundle_json(&papers, &edges, &analytics, json_p).expect("JSON write failed");
+            }
+        }
+        Some(Commands::ImpactDigest {
+            from_db,
+            from_file,
+            horizon,
+            exclude_retracted,
+            export_json,
+            export_csv,
+        }) => {
+            let (papers, edges) = load_corpus_from_sources(&from_db, &from_file);
+            let params = AnalyticsParams {
+                horizon_year: horizon,
+                exclude_retracted,
+                ..Default::default()
+            };
+            let analytics = compute_corpus_analytics(&papers, &edges, &params);
+            let digest = build_bibliometric_impact_digest(&analytics, horizon);
+            println!(
+                "=== CitAtlas Comparative Bibliometric Impact Digest (Horizon {}, {} papers, {} edges) ===",
+                digest.horizon_year, digest.total_papers, digest.total_edges
+            );
+            println!(
+                "  h-index={} | g-index={} | i10-index={} | e-index={:.2} | Louvain Q={:.4} ({} comms) | Infomap L(M)={:.4}b ({} mods, {:.1}% compression)",
+                digest.h_index,
+                digest.g_index,
+                digest.i10_index,
+                digest.e_index,
+                digest.louvain_modularity_q,
+                digest.louvain_communities,
+                digest.infomap_codelength_bits,
+                digest.infomap_modules,
+                digest.infomap_compression_pct
+            );
+            println!(
+                "  PageRank (Infomap Flow): mean={:.5}, max={:.5} ({}) | Mean CB_u={:.5} | Mean CD={:.4}",
+                digest.mean_pagerank_flow,
+                digest.max_pagerank_flow,
+                digest.top_pagerank_paper_id,
+                digest.mean_betweenness_cb,
+                digest.mean_disruption_cd
+            );
+            for d in &digest.disciplines {
+                println!(
+                    "    [{}] {:<38} n={:>3}  cites={:>6}  h={:>2}  g={:>2}  i10={:>2}  PR_mean={:.5}",
+                    d.code, d.name, d.paper_count, d.total_citations, d.h_index, d.g_index, d.i10_index, d.mean_pagerank_flow
+                );
+            }
+            if let Some(ref json_p) = export_json {
+                export_impact_digest_json(&analytics, horizon, json_p)
+                    .expect("Impact digest JSON write failed");
+                println!("Exported Impact Digest JSON -> {:?}", json_p);
+            }
+            if let Some(ref csv_p) = export_csv {
+                export_impact_digest_csv(&analytics, horizon, csv_p)
+                    .expect("Impact digest CSV write failed");
+                println!("Exported Impact Digest CSV -> {:?}", csv_p);
             }
         }
     }
@@ -2119,5 +2201,60 @@ mod tests {
             stage == "nasa_ads_eprint_pdf"
                 && u.contains("ui.adsabs.harvard.edu/link_gateway/2024MNRAS.528.1122G/EPRINT_PDF")
         }));
+    }
+
+    #[test]
+    fn comparative_bibliometric_impact_digest_computes_h_g_i10_pagerank_and_exports() {
+        use cit_atlas::export::{
+            build_bibliometric_impact_digest, export_impact_digest_csv, export_impact_digest_json,
+            BibliometricImpactDigest,
+        };
+
+        let (papers, edges) = build_empirical_corpus();
+        let analytics = compute_corpus_analytics(&papers, &edges, &AnalyticsParams::default());
+        let digest = build_bibliometric_impact_digest(&analytics, 2026);
+        assert_eq!(digest.total_papers, 47);
+        assert!(digest.h_index >= 4);
+        assert!(digest.g_index >= digest.h_index);
+        assert!(digest.i10_index <= digest.total_papers);
+        assert!(digest.louvain_modularity_q > 0.1);
+        assert!(digest.max_pagerank_flow > 0.0);
+        assert_eq!(digest.disciplines.len(), 6);
+        assert_eq!(digest.top_pagerank_papers.len(), 10);
+
+        // Verify i10-index counts papers with >= 10 citations
+        let mut boosted = papers.clone();
+        boosted[0].external_citations = Some(25);
+        boosted[1].external_citations = Some(10);
+        let boosted_analytics =
+            compute_corpus_analytics(&boosted, &edges, &AnalyticsParams::default());
+        let boosted_digest = build_bibliometric_impact_digest(&boosted_analytics, 2026);
+        assert!(boosted_digest.i10_index >= 2);
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "cit_atlas_impact_digest_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+        let json_p = tmp_dir.join("impact_digest.json");
+        let csv_p = tmp_dir.join("impact_digest.csv");
+
+        export_impact_digest_json(&analytics, 2026, &json_p).expect("export json");
+        export_impact_digest_csv(&analytics, 2026, &csv_p).expect("export csv");
+
+        let parsed: BibliometricImpactDigest = serde_json::from_str(
+            &std::fs::read_to_string(&json_p).expect("read json"),
+        )
+        .expect("parse json");
+        assert_eq!(parsed.h_index, digest.h_index);
+        assert_eq!(parsed.i10_index, digest.i10_index);
+
+        let csv_raw = std::fs::read_to_string(&csv_p).expect("read csv");
+        // 1 header + 1 corpus + 6 disciplines + 10 top_papers = 18 lines
+        assert_eq!(csv_raw.lines().count(), 18);
+        assert!(csv_raw.contains("louvain_modularity_q"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

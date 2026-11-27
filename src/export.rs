@@ -19,6 +19,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::analytics::{compute_pop_citation_metrics, effective_record_citations};
 use crate::graph_viewer::{
     compute_preset_positions, node_radius_for_encoding, node_rgb_for_encoding,
     NodeColorEncoding, NodeSizeEncoding, ViewerLayoutPreset,
@@ -1648,4 +1649,270 @@ pub fn export_gexf(
     }
     out.push_str("    </edges>\n  </graph>\n</gexf>\n");
     fs::write(path, out).map_err(|e| format!("Failed writing GEXF {:?}: {}", path, e))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DisciplineImpactSummary {
+    pub code: String,
+    pub name: String,
+    pub paper_count: usize,
+    pub total_citations: u64,
+    pub h_index: usize,
+    pub g_index: usize,
+    pub i10_index: usize,
+    pub mean_pagerank_flow: f64,
+    pub max_pagerank_flow: f64,
+    pub mean_cb_undir: f64,
+    pub mean_disruption_cd: f64,
+    pub mean_louvain_part_p: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PaperImpactLeader {
+    pub id: String,
+    pub title: String,
+    pub year: i32,
+    pub discipline: String,
+    pub citations: u64,
+    pub pagerank_flow: f64,
+    pub cb_undir: f64,
+    pub louvain_comm: usize,
+    pub infomap_comm: usize,
+    pub disruption_cd: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BibliometricImpactDigest {
+    pub schema_version: String,
+    pub horizon_year: i32,
+    pub total_papers: usize,
+    pub total_edges: usize,
+    pub total_citations: u64,
+    pub h_index: usize,
+    pub g_index: usize,
+    pub i10_index: usize,
+    pub e_index: f64,
+    pub louvain_modularity_q: f64,
+    pub louvain_communities: usize,
+    pub infomap_codelength_bits: f64,
+    pub infomap_modules: usize,
+    pub infomap_compression_pct: f64,
+    pub mean_pagerank_flow: f64,
+    pub max_pagerank_flow: f64,
+    pub top_pagerank_paper_id: String,
+    pub mean_betweenness_cb: f64,
+    pub mean_disruption_cd: f64,
+    pub disciplines: Vec<DisciplineImpactSummary>,
+    pub top_pagerank_papers: Vec<PaperImpactLeader>,
+}
+
+pub fn build_bibliometric_impact_digest(
+    analytics: &CorpusAnalytics,
+    horizon_year: i32,
+) -> BibliometricImpactDigest {
+    let pop = compute_pop_citation_metrics(&analytics.papers, horizon_year);
+    let i10_index = analytics
+        .papers
+        .iter()
+        .filter(|pm| effective_record_citations(&pm.record, pm.in_deg) >= 10)
+        .count();
+
+    let n = analytics.papers.len().max(1) as f64;
+    let sum_pr: f64 = analytics.papers.iter().map(|p| p.infomap_flow).sum();
+    let max_pr_paper = analytics.papers.iter().max_by(|a, b| {
+        a.infomap_flow
+            .partial_cmp(&b.infomap_flow)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let max_pagerank_flow = max_pr_paper.map(|p| p.infomap_flow).unwrap_or(0.0);
+    let top_pagerank_paper_id = max_pr_paper
+        .map(|p| p.record.id.clone())
+        .unwrap_or_default();
+    let mean_betweenness_cb =
+        analytics.papers.iter().map(|p| p.cb_undir).sum::<f64>() / n;
+    let mean_disruption_cd =
+        analytics.papers.iter().map(|p| p.disruption_cd).sum::<f64>() / n;
+
+    let mut disciplines = Vec::with_capacity(Discipline::ALL.len());
+    for disc in Discipline::ALL {
+        let sub: Vec<_> = analytics
+            .papers
+            .iter()
+            .filter(|p| p.record.disc == disc)
+            .cloned()
+            .collect();
+        if sub.is_empty() {
+            disciplines.push(DisciplineImpactSummary {
+                code: disc.code().to_string(),
+                name: disc.full_name().to_string(),
+                paper_count: 0,
+                total_citations: 0,
+                h_index: 0,
+                g_index: 0,
+                i10_index: 0,
+                mean_pagerank_flow: 0.0,
+                max_pagerank_flow: 0.0,
+                mean_cb_undir: 0.0,
+                mean_disruption_cd: 0.0,
+                mean_louvain_part_p: 0.0,
+            });
+            continue;
+        }
+        let d_pop = compute_pop_citation_metrics(&sub, horizon_year);
+        let d_i10 = sub
+            .iter()
+            .filter(|pm| effective_record_citations(&pm.record, pm.in_deg) >= 10)
+            .count();
+        let dn = sub.len() as f64;
+        let d_mean_pr = sub.iter().map(|p| p.infomap_flow).sum::<f64>() / dn;
+        let d_max_pr = sub
+            .iter()
+            .map(|p| p.infomap_flow)
+            .fold(0.0_f64, f64::max);
+        let d_mean_cb = sub.iter().map(|p| p.cb_undir).sum::<f64>() / dn;
+        let d_mean_cd = sub.iter().map(|p| p.disruption_cd).sum::<f64>() / dn;
+        let d_mean_lp = sub.iter().map(|p| p.louvain_part_p).sum::<f64>() / dn;
+        disciplines.push(DisciplineImpactSummary {
+            code: disc.code().to_string(),
+            name: disc.full_name().to_string(),
+            paper_count: sub.len(),
+            total_citations: d_pop.total_citations,
+            h_index: d_pop.h_index,
+            g_index: d_pop.g_index,
+            i10_index: d_i10,
+            mean_pagerank_flow: d_mean_pr,
+            max_pagerank_flow: d_max_pr,
+            mean_cb_undir: d_mean_cb,
+            mean_disruption_cd: d_mean_cd,
+            mean_louvain_part_p: d_mean_lp,
+        });
+    }
+
+    let mut ranked = analytics.papers.clone();
+    ranked.sort_by(|a, b| {
+        b.infomap_flow
+            .partial_cmp(&a.infomap_flow)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_pagerank_papers = ranked
+        .into_iter()
+        .take(10)
+        .map(|p| PaperImpactLeader {
+            citations: effective_record_citations(&p.record, p.in_deg),
+            id: p.record.id,
+            title: p.record.title,
+            year: p.record.year,
+            discipline: p.record.disc.code().to_string(),
+            pagerank_flow: p.infomap_flow,
+            cb_undir: p.cb_undir,
+            louvain_comm: p.louvain_comm + 1,
+            infomap_comm: p.infomap_comm + 1,
+            disruption_cd: p.disruption_cd,
+        })
+        .collect();
+
+    BibliometricImpactDigest {
+        schema_version: "1.0".to_string(),
+        horizon_year,
+        total_papers: analytics.papers.len(),
+        total_edges: analytics.active_edges.len(),
+        total_citations: pop.total_citations,
+        h_index: pop.h_index,
+        g_index: pop.g_index,
+        i10_index,
+        e_index: pop.e_index,
+        louvain_modularity_q: analytics.communities.louvain.modularity_q,
+        louvain_communities: analytics.communities.louvain.num_communities,
+        infomap_codelength_bits: analytics.communities.infomap.codelength_bits,
+        infomap_modules: analytics.communities.infomap.num_modules,
+        infomap_compression_pct: analytics.communities.infomap.relative_compression_pct,
+        mean_pagerank_flow: if analytics.papers.is_empty() {
+            0.0
+        } else {
+            sum_pr / n
+        },
+        max_pagerank_flow,
+        top_pagerank_paper_id,
+        mean_betweenness_cb,
+        mean_disruption_cd,
+        disciplines,
+        top_pagerank_papers,
+    }
+}
+
+pub fn format_impact_digest_csv(digest: &BibliometricImpactDigest) -> String {
+    let mut lines = Vec::with_capacity(2 + digest.disciplines.len() + digest.top_pagerank_papers.len());
+    lines.push(
+        "scope,key,label,paper_count,total_citations,h_index,g_index,i10_index,pagerank_flow,louvain_modularity_q,louvain_communities,infomap_codelength_bits,mean_cb_undir,mean_disruption_cd"
+            .to_string(),
+    );
+    lines.push(format!(
+        "corpus,ALL,Full Corpus (Horizon {}),{},{},{},{},{},{:.6},{:.5},{},{:.5},{:.5},{:.5}",
+        digest.horizon_year,
+        digest.total_papers,
+        digest.total_citations,
+        digest.h_index,
+        digest.g_index,
+        digest.i10_index,
+        digest.mean_pagerank_flow,
+        digest.louvain_modularity_q,
+        digest.louvain_communities,
+        digest.infomap_codelength_bits,
+        digest.mean_betweenness_cb,
+        digest.mean_disruption_cd,
+    ));
+    for d in &digest.disciplines {
+        lines.push(format!(
+            "discipline,{},{},{},{},{},{},{},{:.6},{:.5},{},{:.5},{:.5},{:.5}",
+            csv_escape(&d.code),
+            csv_escape(&d.name),
+            d.paper_count,
+            d.total_citations,
+            d.h_index,
+            d.g_index,
+            d.i10_index,
+            d.mean_pagerank_flow,
+            digest.louvain_modularity_q,
+            digest.louvain_communities,
+            digest.infomap_codelength_bits,
+            d.mean_cb_undir,
+            d.mean_disruption_cd,
+        ));
+    }
+    for p in &digest.top_pagerank_papers {
+        lines.push(format!(
+            "top_paper,{},{},1,{},0,0,0,{:.6},{:.5},{},{:.5},{:.5},{:.5}",
+            csv_escape(&p.id),
+            csv_escape(&p.title),
+            p.citations,
+            p.pagerank_flow,
+            digest.louvain_modularity_q,
+            p.louvain_comm,
+            digest.infomap_codelength_bits,
+            p.cb_undir,
+            p.disruption_cd,
+        ));
+    }
+    lines.join("\n") + "\n"
+}
+
+pub fn export_impact_digest_json(
+    analytics: &CorpusAnalytics,
+    horizon_year: i32,
+    path: &Path,
+) -> Result<(), String> {
+    let digest = build_bibliometric_impact_digest(analytics, horizon_year);
+    let text = serde_json::to_string_pretty(&digest)
+        .map_err(|e| format!("Impact digest JSON serialize error: {}", e))?;
+    fs::write(path, text).map_err(|e| format!("Failed writing impact digest JSON {:?}: {}", path, e))
+}
+
+pub fn export_impact_digest_csv(
+    analytics: &CorpusAnalytics,
+    horizon_year: i32,
+    path: &Path,
+) -> Result<(), String> {
+    let digest = build_bibliometric_impact_digest(analytics, horizon_year);
+    let csv = format_impact_digest_csv(&digest);
+    fs::write(path, csv).map_err(|e| format!("Failed writing impact digest CSV {:?}: {}", path, e))
 }

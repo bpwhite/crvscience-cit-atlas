@@ -25,6 +25,7 @@ Native safe-Rust (`#![forbid(unsafe_code)]` library / `#![deny(unsafe_code)]` bi
 | `Space` | Toggle ForceAtlas2 live physics simulation | Guarded by `!ctx.wants_keyboard_input()` |
 | `0` or `R` | Fit camera to active graph bounding box | Guarded by `!ctx.wants_keyboard_input()` |
 | `Ctrl+F` / `Cmd+F` | Focus global `Filter:` text search bar | Global top ribbon |
+| `Ctrl+K` / `Cmd+K` | Open fuzzy Command Palette across views, centrality metrics, cluster overlays & exports | Global modal |
 | `F1` | Toggle About CitAtlas window | Global |
 | `Escape` | Dismiss About window, then Paper Dossier drawer | Global |
 | Mouse Wheel | Cursor-centered smooth zoom (`0.18x` – `12.0x`) | Tab 2 Graph Viewport |
@@ -42,7 +43,8 @@ Native safe-Rust (`#![forbid(unsafe_code)]` library / `#![deny(unsafe_code)]` bi
 | `crawl [QUERY]` | Polite robots-gated SERP & metadata crawl | `--targets`, `--pages`, `--limit`, `--pace-ms`, `--cites-id`, `--local-html`, `--proxy`, `--ignore-robots`, `--hydrate-edges`, `--no-self-citations`, `--db`, `--export-csv-dir` |
 | `screen` | Screen corpus for retractions & bio/DataCite links | `--from-db`, `--from-file`, `--rw-csv`, `--crossref`, `--datacite`, `--epmc-annotations`, `--uniprot-pdb`, `--link-shared-artifacts`, `--save-db`, `--export-csv-dir` |
 | `export-graph` | Export GraphML 1.0 / Gephi GEXF 1.3 networks | `--from-db`, `--from-file`, `--format`, `--layout`, `--color-by`, `--include-datacite-nodes`, `--exclude-retracted`, `--out-dir`, `--out-file` |
-| `export-csv` | Export 1 or all 10 RFC 4180 CSV tables | `--from-db`, `--from-file`, `--exclude-retracted`, `--table`, `--out-dir`, `--out-file` |
+| `export-csv` | Export 1 or all 10 RFC 4180 CSV tables (`--table impact-digest` supported) | `--from-db`, `--from-file`, `--exclude-retracted`, `--table`, `--out-dir`, `--out-file` |
+| `impact-digest` | Export comparative bibliometric impact digest (`h`, `g`, `i10`, PageRank, Louvain `Q` / Infomap `L(M)`) | `--from-db`, `--from-file`, `--horizon`, `--exclude-retracted`, `--export-json`, `--export-csv` |
 | `download` | Batch-download Open-Access PDFs | `--doi`, `--from-db`, `--from-file`, `--out-dir`, `--email`, `--pace-ms` |
 | `analyze` | Compute headless scientometrics & drift | `--from-db`, `--from-file`, `--window`, `--stride`, `--half-life`, `--horizon`, `--exclude-retracted`, `--export-csv`, `--export-csv-dir`, `--export-graphml`, `--export-gexf`, `--export-json`, `--export-svg` |
 | `communities` | Run Louvain $Q(\gamma)$ & Infomap $L(M)$ | `--from-db`, `--from-file`, `--resolution`, `--teleport`, `--export-csv`, `--export-graphml`, `--export-gexf`, `--export-json` |
@@ -52,7 +54,7 @@ Native safe-Rust (`#![forbid(unsafe_code)]` library / `#![deny(unsafe_code)]` bi
 ## Quick Start & Headless Validation
 
 ```bash
-cargo test --all-targets
+cargo test --release   # 62 tests (28 lib + 31 bin + 3 headless_validation)
 cargo run --release
 cargo run --release -- search "quantum mutual information" --providers openaire,inspire,ads --export-csv-dir ./cit_atlas_csv
 cargo run --release -- rate-limits --simulate-burst --export-policies-csv ./domain_rate_policies.csv --export-audit-csv ./crawl_telemetry_audit.csv

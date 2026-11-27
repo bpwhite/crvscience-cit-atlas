@@ -33,6 +33,7 @@ use crate::export::{
     export_all_csv_suite, export_annual_trajectories_csv, export_bio_entity_bridges_csv, export_bundle_json,
     export_crawl_audit_csv, export_domain_policies_csv,
     export_communities_csv, export_edges_csv, export_gexf, export_graphml,
+    export_impact_digest_csv, export_impact_digest_json,
     export_integrity_and_datacite_csv, export_jsd_matrix_csv, export_metrics_csv,
     export_raw_papers_csv, export_synthesis_svg, export_topic_drift_csv, format_bibtex_corpus,
 };
@@ -158,6 +159,8 @@ pub struct CitAtlasApp {
     pub dossier_selection: DossierSelection,
     pub show_dossier_panel: bool,
     pub show_about_window: bool,
+    pub show_command_palette: bool,
+    pub palette_query: String,
     pub status_banner: String,
 
     // Velocity tab
@@ -309,6 +312,8 @@ impl CitAtlasApp {
             dossier_selection: DossierSelection::Paper("shannon1948".to_string()),
             show_dossier_panel: false,
             show_about_window: false,
+            show_command_palette: false,
+            palette_query: String::new(),
             status_banner: "Ready — 47 verified landmark papers and 78 citation edges loaded.".to_string(),
             compared_ids: vec![
                 "shannon1948".to_string(),
@@ -402,7 +407,9 @@ impl CitAtlasApp {
                 }
             }
             if !valid_ids.contains(self.path_src_id.as_str()) {
-                self.path_src_id = self.analytics.papers.last().unwrap().record.id.clone();
+                if let Some(last) = self.analytics.papers.last() {
+                    self.path_src_id = last.record.id.clone();
+                }
             }
             if !valid_ids.contains(self.path_dst_id.as_str()) {
                 self.path_dst_id = self.analytics.papers[0].record.id.clone();
@@ -1258,11 +1265,16 @@ impl CitAtlasApp {
     pub fn update_ui(&mut self, ctx: &egui::Context) {
         self.poll_worker_events(ctx);
 
+        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::K)) {
+            self.show_command_palette = !self.show_command_palette;
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.show_about_window = !self.show_about_window;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.show_about_window {
+            if self.show_command_palette {
+                self.show_command_palette = false;
+            } else if self.show_about_window {
                 self.show_about_window = false;
             } else if self.show_dossier_panel {
                 self.show_dossier_panel = false;
@@ -1445,6 +1457,15 @@ impl CitAtlasApp {
                 {
                     self.show_dossier_panel = !self.show_dossier_panel;
                 }
+                if ui
+                    .selectable_label(
+                        self.show_command_palette,
+                        RichText::new("Ctrl+K Palette").color(Color32::from_rgb(250, 204, 21)),
+                    )
+                    .clicked()
+                {
+                    self.show_command_palette = !self.show_command_palette;
+                }
             });
             if changed {
                 self.pending_params_recompute = false;
@@ -1492,6 +1513,10 @@ impl CitAtlasApp {
                 });
             });
         });
+
+        if self.show_command_palette {
+            self.draw_command_palette_modal(ctx);
+        }
 
         if self.show_about_window {
             let mut open = self.show_about_window;
@@ -1565,6 +1590,234 @@ impl CitAtlasApp {
 }
 
 impl CitAtlasApp {
+    fn draw_command_palette_modal(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_command_palette;
+        let mut chosen_domain: Option<ActiveDomain> = None;
+        let mut chosen_size: Option<NodeSizeEncoding> = None;
+        let mut chosen_color: Option<NodeColorEncoding> = None;
+        let mut chosen_layout: Option<ViewerLayoutPreset> = None;
+        let mut trigger_toggle_physics = false;
+        let mut trigger_fit = false;
+        let mut trigger_export_digest_json = false;
+        let mut trigger_export_digest_csv = false;
+        let mut trigger_export_all_csv = false;
+        let mut trigger_export_bundle_json = false;
+
+        egui::Window::new("CitAtlas Command Palette (Ctrl+K)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(540.0)
+            .anchor(Align2::CENTER_TOP, [0.0, 64.0])
+            .show(ctx, |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette_query)
+                        .id_salt("cit_atlas_palette_input")
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Filter views, centrality metrics, cluster overlays, layouts, or exports..."),
+                );
+                resp.request_focus();
+                ui.separator();
+
+                let q = self.palette_query.trim().to_ascii_lowercase();
+                let matches = |hay: &str| -> bool {
+                    q.is_empty()
+                        || q.split_whitespace()
+                            .all(|tok| hay.to_ascii_lowercase().contains(tok))
+                };
+
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    let view_items = [
+                        (ActiveDomain::SearchAndDownload, "1. Literature Search (Publish or Perish) view tab"),
+                        (ActiveDomain::NetworkGraphViewer, "2. Citation Graph Viewer wgpu network view tab"),
+                        (ActiveDomain::Observatory, "3. Observatory metrics dashboard view tab"),
+                        (ActiveDomain::VelocityAndAwakening, "4. Velocity & Sleeping Beauty Awakening view tab"),
+                        (ActiveDomain::BridgeCartography, "5. Bridge Cartography Burt Guimera-Amaral view tab"),
+                        (ActiveDomain::CommunitiesLouvainInfomap, "6. Louvain Modularity & Infomap Flow view tab"),
+                        (ActiveDomain::TopicDriftMiJsd, "7. Topic Drift MI & JSD Divergence view tab"),
+                        (ActiveDomain::LedgerAndLab, "8. SQLite Ledger & CSV Export Suite view tab"),
+                        (ActiveDomain::RateLimiterAndAudit, "9. Rate Limiter & Crawl Audit Telemetry view tab"),
+                    ];
+                    for (dom, label) in view_items {
+                        if matches(label)
+                            && ui
+                                .selectable_label(self.domain == dom, format!("[View] {label}"))
+                                .clicked()
+                        {
+                            chosen_domain = Some(dom);
+                        }
+                    }
+
+                    ui.separator();
+                    let size_items = [
+                        (NodeSizeEncoding::BrandesBetweenness, "Centrality: Brandes Betweenness CB_u size metric"),
+                        (NodeSizeEncoding::InCitations, "Centrality: In-Corpus Citations size metric"),
+                        (NodeSizeEncoding::InfomapFlow, "Centrality: Ergodic PageRank / Infomap Flow size metric"),
+                        (NodeSizeEncoding::VelocityVExp, "Centrality: Exponential Decay Velocity v_exp size metric"),
+                        (NodeSizeEncoding::SleepingBeautyB, "Centrality: Sleeping Beauty B coefficient size metric"),
+                        (NodeSizeEncoding::DataCiteDownloads, "Centrality: DataCite Artifact Downloads size metric"),
+                        (NodeSizeEncoding::BioEntityBridges, "Centrality: Bio-Entity Bridges UniProt PDB EPMC size metric"),
+                    ];
+                    for (sz, label) in size_items {
+                        if matches(label)
+                            && ui
+                                .selectable_label(self.graph_viewer.size_by == sz, format!("[Metric] {label}"))
+                                .clicked()
+                        {
+                            chosen_size = Some(sz);
+                        }
+                    }
+
+                    ui.separator();
+                    let color_items = [
+                        (NodeColorEncoding::Discipline, "Overlay: Discipline Color Clusters"),
+                        (NodeColorEncoding::LouvainCommunity, "Overlay: Louvain Q Community Clusters"),
+                        (NodeColorEncoding::InfomapModule, "Overlay: Infomap Flow Module Clusters"),
+                        (NodeColorEncoding::VelocityVExp, "Overlay: Citation Decay Velocity Heatmap"),
+                        (NodeColorEncoding::SleepingBeautyB, "Overlay: Sleeping Beauty Awakening Overlay"),
+                        (NodeColorEncoding::IntegrityStatus, "Overlay: Retraction Watch Integrity Overlay"),
+                        (NodeColorEncoding::BioEntityRichness, "Overlay: Bio-Entity Richness Overlay"),
+                    ];
+                    for (col, label) in color_items {
+                        if matches(label)
+                            && ui
+                                .selectable_label(self.graph_viewer.color_by == col, format!("[Overlay] {label}"))
+                                .clicked()
+                        {
+                            chosen_color = Some(col);
+                        }
+                    }
+
+                    let layout_items = [
+                        (ViewerLayoutPreset::ForceAtlas2, "Layout: ForceAtlas2 Physics"),
+                        (ViewerLayoutPreset::HierarchicalDag, "Layout: Chronological DAG"),
+                        (ViewerLayoutPreset::CommunityGalaxies, "Layout: Community Galaxies"),
+                        (ViewerLayoutPreset::RadialEgo, "Layout: Radial Ego Rings"),
+                        (ViewerLayoutPreset::CartographicPlane, "Layout: Cartographic (P, z) Plane"),
+                    ];
+                    for (lay, label) in layout_items {
+                        if matches(label)
+                            && ui
+                                .selectable_label(self.graph_viewer.layout == lay, format!("[Layout] {label}"))
+                                .clicked()
+                        {
+                            chosen_layout = Some(lay);
+                        }
+                    }
+
+                    ui.separator();
+                    if matches("toggle forceatlas2 physics simulation space")
+                        && ui.button("[Graph] Toggle ForceAtlas2 Physics Simulation (Space)").clicked()
+                    {
+                        trigger_toggle_physics = true;
+                    }
+                    if matches("fit camera reset graph viewport")
+                        && ui.button("[Graph] Fit Camera to Active Graph (R)").clicked()
+                    {
+                        trigger_fit = true;
+                    }
+                    if matches("export bibliometric impact digest json h-index g-index i10 pagerank modularity")
+                        && ui.button("[Export] Bibliometric Impact Digest (.JSON)").clicked()
+                    {
+                        trigger_export_digest_json = true;
+                    }
+                    if matches("export bibliometric impact digest csv h-index g-index i10 pagerank modularity")
+                        && ui.button("[Export] Bibliometric Impact Digest (.CSV)").clicked()
+                    {
+                        trigger_export_digest_csv = true;
+                    }
+                    if matches("export all 10 csv tables suite")
+                        && ui.button("[Export] All 10 RFC 4180 CSV Tables").clicked()
+                    {
+                        trigger_export_all_csv = true;
+                    }
+                    if matches("export graph bundle json")
+                        && ui.button("[Export] Graph Bundle (.JSON)").clicked()
+                    {
+                        trigger_export_bundle_json = true;
+                    }
+                });
+            });
+
+        if let Some(d) = chosen_domain {
+            self.domain = d;
+            open = false;
+        }
+        if let Some(sz) = chosen_size {
+            self.graph_viewer.size_by = sz;
+            self.domain = ActiveDomain::NetworkGraphViewer;
+            self.bump_gpu_revision();
+            open = false;
+        }
+        if let Some(col) = chosen_color {
+            self.graph_viewer.color_by = col;
+            self.domain = ActiveDomain::NetworkGraphViewer;
+            if matches!(
+                self.graph_viewer.layout,
+                ViewerLayoutPreset::CommunityGalaxies | ViewerLayoutPreset::CartographicPlane
+            ) {
+                self.recompute_layout();
+            }
+            self.bump_gpu_revision();
+            open = false;
+        }
+        if let Some(lay) = chosen_layout {
+            self.graph_viewer.layout = lay;
+            self.domain = ActiveDomain::NetworkGraphViewer;
+            self.recompute_layout();
+            self.bump_gpu_revision();
+            open = false;
+        }
+        if trigger_toggle_physics {
+            self.graph_viewer.physics_running = !self.graph_viewer.physics_running;
+            self.domain = ActiveDomain::NetworkGraphViewer;
+            open = false;
+        }
+        if trigger_fit {
+            self.fit_graph_to_viewport();
+            open = false;
+        }
+        if trigger_export_digest_json {
+            let out_p = std::path::Path::new("cit_atlas_impact_digest.json");
+            match export_impact_digest_json(&self.analytics, self.params.horizon_year, out_p) {
+                Ok(_) => {
+                    self.status_banner = format!("Exported bibliometric impact digest to {}", out_p.display());
+                }
+                Err(e) => self.status_banner = e,
+            }
+            open = false;
+        }
+        if trigger_export_digest_csv {
+            let out_p = std::path::Path::new("cit_atlas_impact_digest.csv");
+            match export_impact_digest_csv(&self.analytics, self.params.horizon_year, out_p) {
+                Ok(_) => {
+                    self.status_banner = format!("Exported bibliometric impact digest to {}", out_p.display());
+                }
+                Err(e) => self.status_banner = e,
+            }
+            open = false;
+        }
+        if trigger_export_all_csv {
+            let out_d = std::path::Path::new(self.csv_export_dir_input.trim());
+            match export_all_csv_suite(&self.raw_papers, &self.raw_edges, &self.analytics, out_d) {
+                Ok(files) => {
+                    self.status_banner = format!("Exported {} CSV tables to {}", files.len(), out_d.display());
+                }
+                Err(e) => self.status_banner = e,
+            }
+            open = false;
+        }
+        if trigger_export_bundle_json {
+            let out_p = std::path::Path::new("cit_atlas_bundle.json");
+            match export_bundle_json(&self.raw_papers, &self.raw_edges, &self.analytics, out_p) {
+                Ok(_) => self.status_banner = format!("Exported graph bundle to {}", out_p.display()),
+                Err(e) => self.status_banner = e,
+            }
+            open = false;
+        }
+        self.show_command_palette = open;
+    }
+
     fn ui_dossier_panel(&mut self, ui: &mut egui::Ui) {
         match self.dossier_selection.clone() {
             DossierSelection::DataCiteArtifact(doi) => {
@@ -6754,6 +7007,30 @@ impl CitAtlasApp {
                             }
                         }
                     }
+                    if ui.button("Impact Digest JSON").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("JSON Digest", &["json"])
+                            .set_file_name("cit_atlas_impact_digest.json")
+                            .save_file()
+                        {
+                            match export_impact_digest_json(&self.analytics, self.params.horizon_year, &p) {
+                                Ok(_) => self.status_banner = format!("Exported bibliometric impact digest {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
+                        }
+                    }
+                    if ui.button("Impact Digest CSV").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("CSV Digest", &["csv"])
+                            .set_file_name("cit_atlas_impact_digest.csv")
+                            .save_file()
+                        {
+                            match export_impact_digest_csv(&self.analytics, self.params.horizon_year, &p) {
+                                Ok(_) => self.status_banner = format!("Exported bibliometric impact digest {}", p.display()),
+                                Err(e) => self.status_banner = e,
+                            }
+                        }
+                    }
                 });
             });
 
@@ -8019,5 +8296,37 @@ mod tests {
         );
         app.reset_all_filters();
         assert_eq!(app.analytics.papers.len(), 47);
+    }
+
+    #[test]
+    fn headless_ctrl_k_command_palette_toggles_and_escapes() {
+        let ctx = egui::Context::default();
+        let mut app = CitAtlasApp::new_with_ctx(&ctx, false, "test".to_string());
+        assert!(!app.show_command_palette);
+
+        let step_key = |app: &mut CitAtlasApp, key: egui::Key, modifiers: egui::Modifiers| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                modifiers,
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            let _ = ctx.run(raw, |c| app.update_ui(c));
+        };
+
+        step_key(&mut app, egui::Key::K, egui::Modifiers::CTRL);
+        assert!(app.show_command_palette);
+
+        step_key(&mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!app.show_command_palette);
     }
 }
